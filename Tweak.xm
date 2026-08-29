@@ -201,6 +201,12 @@ static void CYHideChatButton(id tbc, NSString *when) {
 
 %hook CYADLaunchViewController
 
+// 只打日志，确认开屏广告页到底有没有被实例化（"偶尔会弹"很难复现，靠日志蹲）
+- (void)viewDidLoad {
+    %orig;
+    CYLog(@"[ADLaunch] viewDidLoad — 开屏广告页已实例化");
+}
+
 // 只掐"请求 / 加载 / 预加载"这类无返回值的入口，绝不动带 completion 的方法：
 // 不回调 completion 会让 App 卡在开屏流程上。
 - (void)requestADInfoWithIsHot:(BOOL)isHot hotArray:(NSArray *)hotArray {
@@ -246,24 +252,59 @@ static void CYHideChatButton(id tbc, NSString *when) {
 
 %end
 
-#pragma mark - 开屏付费弹窗：出现即隐藏
+#pragma mark - 浮层监控 + 广告兜底隐藏（事件驱动，不做轮询）
 
-// CYPayLaunchView / CYPayLaunchOtherView 是纯广告视图，不属于正常页面，
-// 挂到 window 上就直接隐藏，不影响会员中心等正常业务页。
-static BOOL CYIsAdViewClassName(NSString *cls) {
+// 判断某个类名是否属于"会员/付费推广浮层"。
+// 只针对浮层视图（Toast / Launch / Popup / Banner），绝不碰 ViewController 的根 view，
+// 所以会员中心、订阅页这类正常业务页不会被误伤。
+static BOOL CYIsAdOverlayClassName(NSString *cls) {
     if (!cls.length) return NO;
-    if ([cls hasSuffix:@"CYPayLaunchView"]) return YES;
-    if ([cls hasSuffix:@"CYPayLaunchOtherView"]) return YES;
-    return NO;
+    NSString *lo = cls.lowercaseString;
+    // 开屏付费弹窗（CYPayLaunchView / CYPayLaunchOtherView）
+    if ([cls hasSuffix:@"PayLaunchView"]) return YES;
+    if ([cls hasSuffix:@"PayLaunchOtherView"]) return YES;
+    // 会员推广浮层：必须同时命中"会员语义"和"浮层形态"
+    BOOL memberish = [lo containsString:@"svip"] || [lo containsString:@"vip"] ||
+                     [lo containsString:@"member"] || [lo containsString:@"pay"];
+    BOOL overlay = [lo containsString:@"toast"] || [lo containsString:@"popup"] ||
+                   [lo containsString:@"launch"] || [lo containsString:@"banner"] ||
+                   [lo containsString:@"activity"] || [lo containsString:@"advert"];
+    return memberish && overlay;
+}
+
+// 是否值得记一条日志（控制日志量：只看自定义类，跳过系统 UIKit 视图）
+static BOOL CYIsInterestingOverlay(NSString *cls) {
+    if ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"_UI"]) return NO;
+    if (!cls.length) return NO;
+    return YES;
 }
 
 %hook UIView
 
+// 事件驱动：任何视图挂到 window 上时触发一次，不做定时轮询（避免额外 CPU/能耗）。
 - (void)didMoveToWindow {
     %orig;
-    if (self.window && CYIsAdViewClassName(NSStringFromClass([self class]))) {
-        CYLog(@"[AdView] hid %@", NSStringFromClass([self class]));
+    UIWindow *win = self.window;
+    if (!win) return;
+
+    NSString *cls = NSStringFromClass([self class]);
+    // 只关心直接挂在 window 上的那一层——弹窗/浮层都在这里
+    if (self.superview == win && CYIsInterestingOverlay(cls)) {
+        CYLog(@"[Overlay] %@ f=(%.0f,%.0f,%.0f,%.0f)", cls, self.frame.origin.x,
+              self.frame.origin.y, self.frame.size.width, self.frame.size.height);
+    }
+    if (CYIsAdOverlayClassName(cls)) {
+        CYLog(@"[AdOverlay] hid %@", cls);
         self.hidden = YES;
+        // 广告容器本身也一起摘掉，避免留下透明遮罩挡住点击
+        if (self.superview && self.superview != win) {
+            UIView *container = self.superview;
+            if (container.subviews.count <= 2 &&
+                container.frame.size.width >= win.bounds.size.width * 0.8) {
+                container.hidden = YES;
+                CYLog(@"[AdOverlay] hid container %@", NSStringFromClass([container class]));
+            }
+        }
     }
 }
 
@@ -307,6 +348,19 @@ static void CYBlackhole(id self, SEL _cmd) {
     CYLog(@"[Popup] blocked %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
 }
 
+// 诊断：把某个类的全部方法名列出来（找真实弹窗入口用）
+static void CYLogMethodList(Class cls, NSUInteger limit) {
+    if (!cls) { CYLog(@"[Diag] class nil"); return; }
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(cls, &n);
+    CYLog(@"[Diag] === %@ methods=%u ===", NSStringFromClass(cls), n);
+    NSUInteger c = n < limit ? n : limit;
+    for (NSUInteger i = 0; i < c; i++) {
+        CYLog(@"[Diag]   %@", NSStringFromSelector(method_getName(ms[i])));
+    }
+    free(ms);
+}
+
 static void CYHookVoidHandleMethods(Class cls) {
     if (!cls) return;
     unsigned int n = 0;
@@ -345,12 +399,16 @@ static Class CYFindClass(NSArray<NSString *> *candidates) {
 %ctor {
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
 
+    // 之前猜的 handlePopupArray: 之类全是错的（实测 0 个 handle* 方法），
+    // 这里把真实方法名列出来，下一版才能精准拦截。
     Class popup = CYFindClass(@[@"ColorfulCloudsPro.CYPopupModel",
                                 @"_TtC17ColorfulCloudsPro12CYPopupModel",
                                 @"CYPopupModel"]);
     if (popup) {
+        CYLogMethodList(popup, 80);
         CYHookVoidHandleMethods(popup);
     } else {
         CYLog(@"[SwiftHook] CYPopupModel NOT FOUND");
     }
+    CYLogMethodList(objc_getClass("CYRouteModel"), 40);
 }
