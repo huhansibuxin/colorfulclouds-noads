@@ -336,6 +336,54 @@ static void CYDumpViewHierarchy(UIView *view, int depth, int maxDepth) {
     }
 }
 
+// 只打印位于屏幕底部区域的视图（tabbar 就在那儿），避免整棵树刷屏
+static void CYDumpBottomViews(UIView *view, CGFloat bottomY, int depth) {
+    if (!view || depth > 12) return;
+    CGRect f = view.frame;
+    // 视图本身或其子视图区域落在底部 → 打印
+    BOOL inBottom = (f.origin.y >= bottomY) || (f.origin.y + f.size.height >= bottomY);
+    if (inBottom) {
+        NSString *indent = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+        NSString *cls = NSStringFromClass([view class]);
+        CYLog(@"[Bottom]%@%@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d tag=%ld acc='%@'",
+              indent, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
+              view.hidden, (long)view.tag, view.accessibilityIdentifier ?: @"");
+        if ([view isKindOfClass:[UIButton class]]) {
+            CYLog(@"[Bottom]%@  -> title='%@'", indent, [(UIButton *)view currentTitle] ?: @"");
+        }
+        if ([view isKindOfClass:[UILabel class]]) {
+            CYLog(@"[Bottom]%@  -> label='%@'", indent, [(UILabel *)view text] ?: @"");
+        }
+    }
+    for (UIView *sub in view.subviews) {
+        CYDumpBottomViews(sub, bottomY, depth + 1);
+    }
+}
+
+// 从 keyWindow 根视图开始，把底部 tabbar 整条路径挖出来
+static void CYDumpTabBarArea(void) {
+    UIWindow *win = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive &&
+                [scene isKindOfClass:[UIWindowScene class]]) {
+                for (UIWindow *w in [(UIWindowScene *)scene windows]) {
+                    if (w.isKeyWindow) { win = w; break; }
+                }
+            }
+        }
+    }
+    if (!win) win = UIApplication.sharedApplication.keyWindow;
+    if (!win) { CYLog(@"[Bottom] no keyWindow"); return; }
+
+    CGFloat h = win.bounds.size.height;
+    CGFloat bottomY = h - 160.0;
+    CYLog(@"[Bottom] === keyWindow=%@ h=%.0f bottomY=%.0f ===",
+          NSStringFromClass([win class]), h, bottomY);
+    CYDumpBottomViews(win, bottomY, 0);
+    CYLog(@"[Bottom] === end ===");
+}
+
 static BOOL CYObjectIsAdPopup(id obj) {
     if (!obj) return NO;
     NSString *combined = @"";
@@ -473,8 +521,9 @@ static BOOL CYObjectIsAdPopup(id obj) {
         CYLog(@"[Tree]   presented: %@", NSStringFromClass([self.presentedViewController class]));
     }
 
-    // 整棵 view 树，深度限制 6
-    CYDumpViewHierarchy(self.view, 0, 6);
+    // 只记结构，不再整树 dump（太冗长且 tabbar 不在这一层）
+    CYLog(@"[Tree] view=%@ subviews=%lu",
+          NSStringFromClass([self.view class]), (unsigned long)self.view.subviews.count);
     CYLog(@"[Tree] === end ===");
 }
 
