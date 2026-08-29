@@ -116,6 +116,8 @@ static BOOL CYObjectIsAdPopup(id obj) {
         [cls containsString:@"MemberToastView"] ||
         [cls containsString:@"SvipToastView"] ||
         [cls containsString:@"SVIPBottomToastView"] ||
+        [cls containsString:@"MemberBottomView"] ||
+        [cls containsString:@"VipBottomView"] ||
         [cls containsString:@"ADLaunch"]) {
         CYLog(@"[AdPopup] block by class: %@", cls);
         return YES;
@@ -267,15 +269,34 @@ static void CYHideChatButton(id tbc, NSString *when) {
 #pragma mark - 浮层监控 + 广告兜底隐藏（事件驱动，不做轮询）
 
 // 判断某个类名是否属于"会员/付费推广浮层"。
-// 只针对浮层视图（Toast / Launch / Popup / Banner），绝不碰 ViewController 的根 view，
-// 所以会员中心、订阅页这类正常业务页不会被误伤。
+// 第一层：硬编码黑名单——静态分析已知的会员类，不管形态直接拉黑；
+// 第二层：组合判断——"会员语义" + "浮层形态"都命中才拦。
+// 只针对浮层视图，绝不碰 ViewController 的根 view，所以会员中心等正常业务页不会被误伤。
 static BOOL CYIsAdOverlayClassName(NSString *cls) {
     if (!cls.length) return NO;
+    // ① 硬编码黑名单（来自静态 class-dump，改名后靠 [Overlay] 日志再补）
+    static NSSet *hard = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        hard = [NSSet setWithObjects:
+            @"ColorfulCloudsPro.CYPayLaunchView",
+            @"ColorfulCloudsPro.CYPayLaunchOtherView",
+            @"ColorfulCloudsPro.CYMemberBottomView",
+            @"ColorfulCloudsPro.CYVipBottomView",
+            @"ColorfulCloudsPro.CYMemberToastView",
+            @"ColorfulCloudsPro.CYGetSvipToastView",
+            @"ColorfulCloudsPro.CYLightupSVIPBottomToastView",
+            @"ColorfulCloudsPro.CYOneSVIPBottomToastView",
+            @"ColorfulCloudsPro.CYChatPayToastView",
+            @"ColorfulCloudsPro.CYMemberBackToastView",
+            @"ColorfulCloudsPro.CYMemberPayButtonView",
+            nil];
+    });
+    if ([hard containsObject:cls]) return YES;
+    // ② 组合判断兜底
     NSString *lo = cls.lowercaseString;
-    // 开屏付费弹窗（CYPayLaunchView / CYPayLaunchOtherView）
     if ([cls hasSuffix:@"PayLaunchView"]) return YES;
     if ([cls hasSuffix:@"PayLaunchOtherView"]) return YES;
-    // 会员推广浮层：必须同时命中"会员语义"和"浮层形态"
     BOOL memberish = [lo containsString:@"svip"] || [lo containsString:@"vip"] ||
                      [lo containsString:@"member"] || [lo containsString:@"pay"];
     BOOL overlay = [lo containsString:@"toast"] || [lo containsString:@"popup"] ||
