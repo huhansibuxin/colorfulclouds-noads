@@ -14,7 +14,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <substrate.h>
 
 // Logos 只生成 @class 前向声明，访问继承来的成员或自己的方法必须先声明。
 // 属性一律走 KVC（valueForKey:）访问，避免和真实类型耦合。
@@ -44,6 +43,9 @@ static NSURL *CYLogFileURL(void) {
     return url;
 }
 
+// 日志轮转上限：1.5MB（1兆500K）。超过就整文件重写，防止撑爆沙盒。
+static const unsigned long long CYLogRotateBytes = 1572864ULL;
+
 static void CYLog(NSString *fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -51,9 +53,15 @@ static void CYLog(NSString *fmt, ...) {
     va_end(args);
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:CYLogFileURL().path];
+    NSString *path = CYLogFileURL().path;
+    // 大小轮转：超过 1.5MB 直接删掉重写（旧日志丢弃，留最近一段）
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    if (attrs && [attrs fileSize] > CYLogRotateBytes) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) {
-        [[NSFileManager defaultManager] createFileAtPath:CYLogFileURL().path contents:data attributes:nil];
+        [[NSFileManager defaultManager] createFileAtPath:path contents:data attributes:nil];
     } else {
         [fh seekToEndOfFile];
         [fh writeData:data];
@@ -215,12 +223,6 @@ static void CYHideChatButton(id tbc, NSString *when) {
 
 %hook CYADLaunchViewController
 
-// 只打日志，确认开屏广告页到底有没有被实例化（"偶尔会弹"很难复现，靠日志蹲）
-- (void)viewDidLoad {
-    %orig;
-    CYLog(@"[ADLaunch] viewDidLoad — 开屏广告页已实例化");
-}
-
 // 只掐"请求 / 加载 / 预加载"这类无返回值的入口，绝不动带 completion 的方法：
 // 不回调 completion 会让 App 卡在开屏流程上。
 - (void)requestADInfoWithIsHot:(BOOL)isHot hotArray:(NSArray *)hotArray {
@@ -305,13 +307,6 @@ static BOOL CYIsAdOverlayClassName(NSString *cls) {
     return memberish && overlay;
 }
 
-// 是否值得记一条日志（控制日志量：只看自定义类，跳过系统 UIKit 视图）
-static BOOL CYIsInterestingOverlay(NSString *cls) {
-    if ([cls hasPrefix:@"UI"] || [cls hasPrefix:@"_UI"]) return NO;
-    if (!cls.length) return NO;
-    return YES;
-}
-
 // 通用弹窗形态判定：直接挂 window 上的自定义浮层，若盖住屏幕中心、尺寸适中
 // （面积约 4%~92% 屏幕），就是一个"卡片式弹窗"——不管它是什么业务，一律拦。
 static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
@@ -334,15 +329,10 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
     if (!win) return;
 
     NSString *cls = NSStringFromClass([self class]);
-    // 只关心直接挂在 window 上的那一层——弹窗/浮层都在这里
-    if (self.superview == win && CYIsInterestingOverlay(cls)) {
-        CYLog(@"[Overlay] %@ f=(%.0f,%.0f,%.0f,%.0f)", cls, self.frame.origin.x,
-              self.frame.origin.y, self.frame.size.width, self.frame.size.height);
-        // 兜底 A：任何"居中卡片"自定义浮层都当弹窗干掉（不挑业务，全拦）
-        if (CYLooksLikePopupOverlay(self, win)) {
-            CYLog(@"[Overlay] popup-like %@ -> hidden", cls);
-            self.hidden = YES;
-        }
+    // 兜底 A：直接挂 window 的"居中卡片"浮层一律当弹窗干掉（不挑业务，全拦）
+    if (self.superview == win && CYLooksLikePopupOverlay(self, win)) {
+        CYLog(@"[Overlay] popup-like %@ -> hidden", cls);
+        self.hidden = YES;
     }
     // 兜底 B：类名带会员/付费语义的浮层，直接隐藏
     if (CYIsAdOverlayClassName(cls)) {
@@ -442,76 +432,6 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 
 %end
 
-#pragma mark - Swift 弹窗模型：拦掉所有 handle* 方法
-
-// CYPopupModel 是 Swift 类，运行时名带模块前缀。之前写成
-// %hook _TtC17ColorfulCloudsPro12CYPopupModel 是错的（objc_getClass 返回 nil，hook 静默失效）。
-// 这里在运行时枚举方法，把返回值为 void 的 handle* 全替换成空实现。
-static void CYBlackhole(id self, SEL _cmd) {
-    CYLog(@"[Popup] blocked %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
-}
-
-// 诊断：把某个类的全部方法名列出来（找真实弹窗入口用）
-static void CYLogMethodList(Class cls, NSUInteger limit) {
-    if (!cls) { CYLog(@"[Diag] class nil"); return; }
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    CYLog(@"[Diag] === %@ methods=%u ===", NSStringFromClass(cls), n);
-    NSUInteger c = n < limit ? n : limit;
-    for (NSUInteger i = 0; i < c; i++) {
-        CYLog(@"[Diag]   %@", NSStringFromSelector(method_getName(ms[i])));
-    }
-    free(ms);
-}
-
-static void CYHookVoidHandleMethods(Class cls) {
-    if (!cls) return;
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    if (!ms) return;
-    int hooked = 0;
-    for (unsigned int i = 0; i < n; i++) {
-        SEL sel = method_getName(ms[i]);
-        NSString *name = NSStringFromSelector(sel);
-        if (![name.lowercaseString hasPrefix:@"handle"]) continue;
-        char ret[16];
-        method_getReturnType(ms[i], ret, sizeof(ret));
-        if (ret[0] != 'v') {           // 只动返回 void 的，避免破坏 getter
-            CYLog(@"[Popup] skip non-void %@", name);
-            continue;
-        }
-        method_setImplementation(ms[i], (IMP)&CYBlackhole);
-        CYLog(@"[Popup] hooked %@ %@", NSStringFromClass(cls), name);
-        hooked++;
-    }
-    free(ms);
-    CYLog(@"[Popup] %@: %d handle* method(s) blocked", NSStringFromClass(cls), hooked);
-}
-
-static Class CYFindClass(NSArray<NSString *> *candidates) {
-    for (NSString *n in candidates) {
-        Class c = objc_getClass(n.UTF8String);
-        if (c) {
-            CYLog(@"[SwiftHook] resolved %@ (super=%@)", n, NSStringFromClass(class_getSuperclass(c)));
-            return c;
-        }
-    }
-    return Nil;
-}
-
 %ctor {
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
-
-    // 之前猜的 handlePopupArray: 之类全是错的（实测 0 个 handle* 方法），
-    // 这里把真实方法名列出来，下一版才能精准拦截。
-    Class popup = CYFindClass(@[@"ColorfulCloudsPro.CYPopupModel",
-                                @"_TtC17ColorfulCloudsPro12CYPopupModel",
-                                @"CYPopupModel"]);
-    if (popup) {
-        CYLogMethodList(popup, 80);
-        CYHookVoidHandleMethods(popup);
-    } else {
-        CYLog(@"[SwiftHook] CYPopupModel NOT FOUND");
-    }
-    CYLogMethodList(objc_getClass("CYRouteModel"), 40);
 }
