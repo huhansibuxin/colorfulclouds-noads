@@ -69,11 +69,13 @@ static NSSet<NSString *> *CYAdKeywords(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         set = [NSSet setWithObjects:
-            @"会员", @"VIP", @"SVIP",
-            @"限时特惠", @"限时优惠", @"限时",
-            @"开通会员", @"购买会员", @"升级会员",
-            @"会员优惠券", @"恢复订阅", @"立即开通",
-            @"连续包月", @"连续包年", @"免费试用",
+            @"会员", @"VIP", @"SVIP", @"vip", @"svip",
+            @"限时特惠", @"限时优惠", @"限时", @"特惠",
+            @"开通会员", @"购买会员", @"升级会员", @"续费", @"到期",
+            @"会员优惠券", @"恢复订阅", @"立即开通", @"立即购买",
+            @"连续包月", @"连续包年", @"免费试用", @"试用",
+            @"折扣", @"优惠", @"福利", @"抽奖", @"红包", @"签到",
+            @"活动", @"推广", @"广告", @"领券", @"领取",
             nil];
     });
     return set;
@@ -104,23 +106,33 @@ static NSString *CYExtractTitleFromObject(id obj) {
     return s;
 }
 
-// 兜底判定：present 出来的 VC 是否属于会员推广弹窗
+// 兜底判定：present 出来的 VC 是否属于"业务推广弹窗"（会员/活动/广告/升级等）。
+// 系统权限弹窗（定位/通知/相册等）一律放行，否则 App 无法正常工作。
 static BOOL CYObjectIsAdPopup(id obj) {
     if (!obj) return NO;
     NSString *cls = NSStringFromClass([obj class]);
-    // 类名层面的硬判定（开屏付费弹窗 / 会员推广视图）
+    // 类名层面的硬判定
     if ([cls containsString:@"PayLaunchView"] ||
         [cls containsString:@"MemberToastView"] ||
         [cls containsString:@"SvipToastView"] ||
-        [cls containsString:@"SVIPBottomToastView"]) {
+        [cls containsString:@"SVIPBottomToastView"] ||
+        [cls containsString:@"ADLaunch"]) {
         CYLog(@"[AdPopup] block by class: %@", cls);
         return YES;
     }
-    // 文案层面的判定
+    // 文案层面的判定（title / message）
     NSString *text = CYExtractTitleFromObject(obj);
     if (CYStringContainsAdKeyword(text)) {
         CYLog(@"[AdPopup] block by keyword: %@ text=%@", cls, text);
         return YES;
+    }
+    // 系统权限弹窗放行（定位/通知/相册/蓝牙/麦克风/粘贴等）
+    if ([text containsString:@"位置"] || [text containsString:@"定位"] ||
+        [text containsString:@"通知"] || [text containsString:@"相册"] ||
+        [text containsString:@"麦克风"] || [text containsString:@"蓝牙"] ||
+        [text containsString:@"粘贴"] || [text containsString:@"权限"] ||
+        [text containsString:@"允许"]) {
+        return NO;
     }
     return NO;
 }
@@ -279,6 +291,19 @@ static BOOL CYIsInterestingOverlay(NSString *cls) {
     return YES;
 }
 
+// 通用弹窗形态判定：直接挂 window 上的自定义浮层，若盖住屏幕中心、尺寸适中
+// （面积约 4%~92% 屏幕），就是一个"卡片式弹窗"——不管它是什么业务，一律拦。
+static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
+    CGRect f = v.frame;
+    CGFloat ww = win.bounds.size.width, wh = win.bounds.size.height;
+    if (ww <= 0 || wh <= 0) return NO;
+    CGPoint center = CGPointMake(ww / 2, wh / 2);
+    if (!CGRectContainsPoint(f, center)) return NO;      // 不盖住屏幕中心 → 不是弹窗
+    CGFloat ratio = (f.size.width * f.size.height) / (ww * wh);
+    if (ratio < 0.04 || ratio > 0.92) return NO;         // 太小的控件 / 全屏页 → 不是弹窗
+    return YES;
+}
+
 %hook UIView
 
 // 事件驱动：任何视图挂到 window 上时触发一次，不做定时轮询（避免额外 CPU/能耗）。
@@ -292,7 +317,13 @@ static BOOL CYIsInterestingOverlay(NSString *cls) {
     if (self.superview == win && CYIsInterestingOverlay(cls)) {
         CYLog(@"[Overlay] %@ f=(%.0f,%.0f,%.0f,%.0f)", cls, self.frame.origin.x,
               self.frame.origin.y, self.frame.size.width, self.frame.size.height);
+        // 兜底 A：任何"居中卡片"自定义浮层都当弹窗干掉（不挑业务，全拦）
+        if (CYLooksLikePopupOverlay(self, win)) {
+            CYLog(@"[Overlay] popup-like %@ -> hidden", cls);
+            self.hidden = YES;
+        }
     }
+    // 兜底 B：类名带会员/付费语义的浮层，直接隐藏
     if (CYIsAdOverlayClassName(cls)) {
         CYLog(@"[AdOverlay] hid %@", cls);
         self.hidden = YES;
@@ -310,7 +341,58 @@ static BOOL CYIsInterestingOverlay(NSString *cls) {
 
 %end
 
-#pragma mark - UIAlertController：会员弹窗兜底
+#pragma mark - CYAlertView 系列：卡片弹窗直接掐掉
+
+@interface CYAlertView : UIView
+@end
+@interface CYAlertContentView : UIView
+@end
+@interface CYThemeAdView : UIView
+@end
+
+%hook CYAlertView
+
+- (void)show {
+    CYLog(@"[CYAlertView] show blocked");
+    return;
+}
+
+- (void)showAlert:(id)arg1 {
+    CYLog(@"[CYAlertView] showAlert: blocked");
+    return;
+}
+
+- (void)showAlert:(id)arg1 showClose:(BOOL)showClose {
+    CYLog(@"[CYAlertView] showAlert:showClose: blocked");
+    return;
+}
+
+%end
+
+%hook CYAlertContentView
+
+- (void)show {
+    CYLog(@"[CYAlertContentView] show blocked");
+    return;
+}
+
+%end
+
+%hook CYThemeAdView
+
+- (instancetype)init {
+    CYLog(@"[CYThemeAdView] init blocked -> nil");
+    return nil;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    CYLog(@"[CYThemeAdView] initWithFrame blocked -> nil");
+    return nil;
+}
+
+%end
+
+#pragma mark - UIAlertController：业务弹窗兜底
 
 %hook UIAlertController
 
