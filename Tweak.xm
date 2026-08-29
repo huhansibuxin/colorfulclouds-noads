@@ -111,37 +111,108 @@ static NSArray<NSString *> *CYAssistantIvarFingerprints(void) {
     return arr;
 }
 
-// 扫描类及其所有父类（最多 6 层）的 ivar 列表，命中 >=2 个指纹即判定为小助手
-static BOOL CYClassLooksLikeAssistant(Class cls) {
-    if (!cls) return NO;
+// 扫描类及其所有父类（最多 6 层）的 ivar + 方法名，统计指纹命中数。
+// 只扫 ivar 是不够的：Swift 存储属性在 ObjC runtime 里未必暴露成 ivar，
+// 但 @objc 方法名一定在 method list 里，两者互补才稳。
+static NSInteger CYClassAssistantScore(Class cls) {
+    if (!cls) return 0;
     NSArray *prints = CYAssistantIvarFingerprints();
     NSInteger hits = 0;
     Class c = cls;
     int depth = 0;
     while (c && depth < 6) {
-        unsigned int count = 0;
-        Ivar *ivars = class_copyIvarList(c, &count);
+        // ivar
+        unsigned int icount = 0;
+        Ivar *ivars = class_copyIvarList(c, &icount);
         if (ivars) {
-            for (unsigned int i = 0; i < count; i++) {
+            for (unsigned int i = 0; i < icount; i++) {
                 const char *nm = ivar_getName(ivars[i]);
                 if (!nm) continue;
                 NSString *low = [@(nm) lowercaseString];
                 for (NSString *p in prints) {
                     if ([low containsString:p]) {
                         hits++;
-                        break; // 同一个 ivar 只计一次
+                        break;
                     }
                 }
             }
             free(ivars);
         }
-        if (hits >= 2) {
-            return YES;
+        // method names
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(c, &mcount);
+        if (methods) {
+            for (unsigned int i = 0; i < mcount; i++) {
+                SEL s = method_getName(methods[i]);
+                if (!s) continue;
+                NSString *low = [NSStringFromSelector(s) lowercaseString];
+                for (NSString *p in prints) {
+                    if ([low containsString:p]) {
+                        hits++;
+                        break;
+                    }
+                }
+            }
+            free(methods);
         }
         c = class_getSuperclass(c);
         depth++;
     }
-    return NO;
+    return hits;
+}
+
+static BOOL CYClassLooksLikeAssistant(Class cls) {
+    return CYClassAssistantScore(cls) >= 2;
+}
+
+// 收集类的全部方法名（含父类，最多 6 层），用于远程诊断
+static NSString *CYMethodNamesOfClass(Class cls, NSUInteger limit) {
+    if (!cls) return @"";
+    NSMutableArray *names = [NSMutableArray array];
+    Class c = cls;
+    int depth = 0;
+    while (c && depth < 6) {
+        unsigned int count = 0;
+        Method *methods = class_copyMethodList(c, &count);
+        if (methods) {
+            for (unsigned int i = 0; i < count && names.count < limit; i++) {
+                SEL s = method_getName(methods[i]);
+                if (s) [names addObject:NSStringFromSelector(s)];
+            }
+            free(methods);
+        }
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    return [names componentsJoinedByString:@" "];
+}
+
+// 诊断：把每个 tab 的类名 / 标题 / 指纹分 / 方法名全量打进日志
+static void CYDumpTabDiagnostics(NSArray *vcs, NSString *where) {
+    if (!vcs.count) {
+        CYLog(@"[Diag][%@] viewControllers is empty", where);
+        return;
+    }
+    CYLog(@"[Diag][%@] %lu tab(s):", where, (unsigned long)vcs.count);
+    NSUInteger idx = 0;
+    for (UIViewController *vc in vcs) {
+        NSString *clsName = NSStringFromClass([vc class]);
+        NSString *itemTitle = [vc respondsToSelector:@selector(tabBarItem)] ? ([vc tabBarItem].title ?: @"") : @"";
+        NSString *vcTitle = [vc respondsToSelector:@selector(title)] ? ([vc title] ?: @"") : @"";
+        UIViewController *root = CYUnwrapRootViewController(vc);
+        NSString *rootCls = root ? NSStringFromClass([root class]) : @"";
+        NSInteger score = root ? CYClassAssistantScore([root class]) : 0;
+        CYLog(@"[Diag]  #%lu cls=%@ rootCls=%@ itemTitle='%@' vcTitle='%@' score=%ld",
+              (unsigned long)idx, clsName, rootCls, itemTitle, vcTitle, (long)score);
+        // 方法名全量输出，便于确认小助手的真实特征
+        NSString *methods = CYMethodNamesOfClass([vc class], 60);
+        CYLog(@"[Diag]     methods[%@]: %@", clsName, methods);
+        if (root && root != vc) {
+            NSString *rMethods = CYMethodNamesOfClass([root class], 60);
+            CYLog(@"[Diag]     methods[%@](root): %@", rootCls, rMethods);
+        }
+        idx++;
+    }
 }
 
 // 解开可能存在的 UINavigationController 包装，取真正的根 VC
@@ -248,13 +319,32 @@ static BOOL CYObjectIsAdPopup(id obj) {
     %orig(filtered.copy, animated);
 }
 
+// 同上：无 animated 的 setter 也要 hook
+- (void)setViewControllers:(NSArray *)viewControllers {
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (id vc in viewControllers) {
+        if (CYViewControllerIsAssistantTab(vc)) {
+            continue;
+        }
+        [filtered addObject:vc];
+    }
+    if (filtered.count != viewControllers.count) {
+        CYLog(@"[UITabBarController] removed %lu assistant tab(s) [no-animated]", (unsigned long)(viewControllers.count - filtered.count));
+    }
+    %orig(filtered.copy);
+}
+
 %end
 
 #pragma mark - CYTabBarController：兜底过滤
 
 %hook CYTabBarController
 
+// 注意：setViewControllers: 与 setViewControllers:animated: 是**两个不同的 selector**，
+// UIKit 内部不保证前者转发后者，两个都必须 hook，否则会整个漏掉。
 - (void)setViewControllers:(NSArray *)viewControllers animated:(BOOL)animated {
+    CYLog(@"[CYTabBarController] setViewControllers:animated: called (%lu)", (unsigned long)viewControllers.count);
+    CYDumpTabDiagnostics(viewControllers, @"setViewControllers:animated:");
     NSMutableArray *filtered = [NSMutableArray array];
     for (id vc in viewControllers) {
         if (CYViewControllerIsAssistantTab(vc)) {
@@ -268,11 +358,28 @@ static BOOL CYObjectIsAdPopup(id obj) {
     %orig(filtered.copy, animated);
 }
 
+- (void)setViewControllers:(NSArray *)viewControllers {
+    CYLog(@"[CYTabBarController] setViewControllers: (no animated) called (%lu)", (unsigned long)viewControllers.count);
+    CYDumpTabDiagnostics(viewControllers, @"setViewControllers:");
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (id vc in viewControllers) {
+        if (CYViewControllerIsAssistantTab(vc)) {
+            continue;
+        }
+        [filtered addObject:vc];
+    }
+    if (filtered.count != viewControllers.count) {
+        CYLog(@"[CYTabBarController] removed %lu assistant tab(s) [no-animated]", (unsigned long)(viewControllers.count - filtered.count));
+    }
+    %orig(filtered.copy);
+}
+
 // 兜底：如果 tab 不是走 setter 初始化的（例如直接赋值 ivar），在界面出现后再清一次
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
     NSArray *vcs = self.viewControllers;
     if (!vcs.count) return;
+    CYDumpTabDiagnostics(vcs, @"viewDidAppear");
     NSMutableArray *filtered = [NSMutableArray array];
     for (id vc in vcs) {
         if (CYViewControllerIsAssistantTab(vc)) {
