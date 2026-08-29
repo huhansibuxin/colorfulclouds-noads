@@ -8,6 +8,34 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+// 前向声明目标类，否则 Logos 只生成 @class，编译器拿不到继承来的属性/方法
+@interface CYTabBarController : UITabBarController
+@end
+
+@interface CYAlertView : UIView
+@end
+
+@interface CYAlertContentView : UIView
+@end
+
+@interface CYADLaunchViewController : UIViewController
+@end
+
+@interface CYADFactory : NSObject
+@end
+
+@interface CYMainADModel : NSObject
+@end
+
+@interface CYThemeAdView : UIView
+@end
+
+@interface CYToastViewController : UIViewController
+@end
+
+@interface CYToastView : UIView
+@end
+
 #pragma mark - 日志工具
 
 static NSURL *CYLogFileURL(void) {
