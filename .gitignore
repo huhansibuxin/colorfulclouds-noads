@@ -1,0 +1,17 @@
+# Theos
+.theos/
+packages/
+obj/
+
+# IPA analysis artifacts
+ipa_unzipped/
+*.ipa
+
+# macOS / Xcode
+.DS_Store
+*.xcuserstate
+
+# Ghidra
+ghidra_projects/
+*.gpr
+*.rep/

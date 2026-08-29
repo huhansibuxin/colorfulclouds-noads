@@ -1,0 +1,9 @@
+Package: com.huhansibuxin.colorfulcloudsnoads
+Name: ColorfulCloudsNoAds
+Depends: mobilesubstrate, ellekit
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Remove assistant tab and block all popup ads in ColorfulClouds Pro
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks

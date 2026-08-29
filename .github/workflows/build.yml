@@ -1,0 +1,42 @@
+name: Build CaiYunRemoveAds
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install dpkg ldid
+
+      - name: Setup Theos
+        run: |
+          git clone --recurse-submodules https://github.com/theos/theos.git $HOME/theos
+
+      - name: Download iOS SDK
+        run: |
+          cd $HOME/theos/sdks
+          curl -sLO https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q master.zip
+          mv sdks-master/iPhoneOS16.5.sdk .
+          rm -rf master.zip sdks-master
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          make package
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ColorfulCloudsNoAds-rootless
+          path: packages/*.deb
