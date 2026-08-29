@@ -111,6 +111,21 @@ static NSArray<NSString *> *CYAssistantIvarFingerprints(void) {
     return arr;
 }
 
+// 解开可能存在的 UINavigationController 包装，取真正的根 VC
+static UIViewController *CYUnwrapRootViewController(UIViewController *vc) {
+    UIViewController *cur = vc;
+    int guard = 0;
+    while (cur && guard < 5) {
+        if ([cur isKindOfClass:[UINavigationController class]]) {
+            cur = [(UINavigationController *)cur viewControllers].firstObject;
+            guard++;
+            continue;
+        }
+        break;
+    }
+    return cur;
+}
+
 // 扫描类及其所有父类（最多 6 层）的 ivar + 方法名，统计指纹命中数。
 // 只扫 ivar 是不够的：Swift 存储属性在 ObjC runtime 里未必暴露成 ivar，
 // 但 @objc 方法名一定在 method list 里，两者互补才稳。
@@ -213,21 +228,6 @@ static void CYDumpTabDiagnostics(NSArray *vcs, NSString *where) {
         }
         idx++;
     }
-}
-
-// 解开可能存在的 UINavigationController 包装，取真正的根 VC
-static UIViewController *CYUnwrapRootViewController(UIViewController *vc) {
-    UIViewController *cur = vc;
-    int guard = 0;
-    while (cur && guard < 5) {
-        if ([cur isKindOfClass:[UINavigationController class]]) {
-            cur = [(UINavigationController *)cur viewControllers].firstObject;
-            guard++;
-            continue;
-        }
-        break;
-    }
-    return cur;
 }
 
 static BOOL CYViewControllerIsAssistantTab(id vc) {
