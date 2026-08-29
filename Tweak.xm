@@ -1,7 +1,14 @@
 //
-// 彩云天气 Pro 去广告 + 去小助手 Tweak
-// Bundle: net.colorfulclouds.app.pro
-// 目标：保留天气/降水图/我的，移除底部「小助手」tab；拦截所有会员推广弹窗广告
+//  彩云天气 Pro 去小助手 + 去广告 Tweak
+//  Bundle: net.colorfulclouds.app.pro
+//
+//  实测有效的两条链路（其余猜测性 hook 已全部删除）：
+//   1. 小助手 = CYTabBarController 自定义底栏 bottomBarView 里的 chatButton。
+//      不是系统 tab，所以过滤 viewControllers 完全无效。
+//      生效点：isShowChat 恒返回 NO + setIsShowChat: 强制 NO
+//      → App 自己不创建小助手按钮，底栏剩 3 个按钮并自动三等分（实测 143px×3）。
+//   2. 广告 = CYADLaunchViewController（开屏）与 CYADFactory（插屏/信息流）。
+//      直接从"请求广告"这一步掐断，不让数据回来，弹窗自然不会出现。
 //
 
 #import <UIKit/UIKit.h>
@@ -9,42 +16,19 @@
 #import <objc/message.h>
 #import <substrate.h>
 
-// 前向声明目标类，否则 Logos 只生成 @class，编译器拿不到继承来的属性/方法
-// CYTabBarController 自带底部自定义栏：bottomBarView 里有 chatButton（小助手）、
-// isShowChat 是它的显示开关、goChat 是跳转入口。属性一律走 KVC 访问，避免类型不匹配。
+// Logos 只生成 @class 前向声明，访问继承来的成员或自己的方法必须先声明。
+// 属性一律走 KVC（valueForKey:）访问，避免和真实类型耦合。
 @interface CYTabBarController : UITabBarController
 - (void)refreshShowChat;
 - (void)refreshBottomView;
 - (void)refreshMyButton;
 - (void)goChat;
-- (void)goWeather;
-@end
-
-@interface CYAlertView : UIView
-@end
-
-@interface CYAlertContentView : UIView
 @end
 
 @interface CYADLaunchViewController : UIViewController
 @end
 
 @interface CYADFactory : NSObject
-@end
-
-@interface CYMainADModel : NSObject
-@end
-
-@interface CYThemeAdView : UIView
-@end
-
-@interface CYToastViewController : UIViewController
-@end
-
-@interface CYToastView : UIView
-@end
-
-@interface CYMainController : UIViewController
 @end
 
 #pragma mark - 日志工具
@@ -78,19 +62,18 @@ static void CYLog(NSString *fmt, ...) {
     NSLog(@"[CaiYunRemoveAds] %@", msg);
 }
 
-#pragma mark - 文本关键词判断（用于识别广告/会员弹窗）
+#pragma mark - 会员/广告文案关键词
 
 static NSSet<NSString *> *CYAdKeywords(void) {
     static NSSet *set = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         set = [NSSet setWithObjects:
-            @"会员", @"VIP", @"SVIP", @"vip", @"svip",
+            @"会员", @"VIP", @"SVIP",
             @"限时特惠", @"限时优惠", @"限时",
-            @"立即查看", @"开通会员", @"购买会员",
-            @"会员购买成功", @"您的会员已经离开",
-            @"会员优惠券", @"恢复订阅",
-            @"彩云天气会员", @"彩云天气SVIP",
+            @"开通会员", @"购买会员", @"升级会员",
+            @"会员优惠券", @"恢复订阅", @"立即开通",
+            @"连续包月", @"连续包年", @"免费试用",
             nil];
     });
     return set;
@@ -100,483 +83,92 @@ static BOOL CYStringContainsAdKeyword(NSString *text) {
     if (!text.length) return NO;
     NSString *low = text.lowercaseString;
     for (NSString *kw in CYAdKeywords()) {
-        if ([low containsString:kw.lowercaseString]) {
-            return YES;
-        }
+        if ([low containsString:kw.lowercaseString]) return YES;
     }
     return NO;
 }
 
-// 小助手（AI 聊天）功能的 ivar 指纹。
-// 这些名字来自二进制 __swift5_reflstr 中 Swift 类的存储属性名，
-// 是小助手聊天界面/ViewModel 独有的，天气与降水图页面不会命中。
-static NSArray<NSString *> *CYAssistantIvarFingerprints(void) {
-    static NSArray *arr = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        arr = @[@"chatinputview", @"chatarray", @"chattableview", @"chatinputbar",
-                @"promptarray", @"historyStatus", @"isrequesthistroy",
-                @"ailabel", @"chatmodel", @"chatimgview", @"chatimages",
-                @"assistant", @"chattextview"];
-    });
-    return arr;
-}
-
-// 解开可能存在的 UINavigationController 包装，取真正的根 VC
-static UIViewController *CYUnwrapRootViewController(UIViewController *vc) {
-    UIViewController *cur = vc;
-    int guard = 0;
-    while (cur && guard < 5) {
-        if ([cur isKindOfClass:[UINavigationController class]]) {
-            cur = [(UINavigationController *)cur viewControllers].firstObject;
-            guard++;
-            continue;
-        }
-        break;
-    }
-    return cur;
-}
-
-// 扫描类及其所有父类（最多 6 层）的 ivar + 方法名，统计指纹命中数。
-// 只扫 ivar 是不够的：Swift 存储属性在 ObjC runtime 里未必暴露成 ivar，
-// 但 @objc 方法名一定在 method list 里，两者互补才稳。
-static NSInteger CYClassAssistantScore(Class cls) {
-    if (!cls) return 0;
-    NSArray *prints = CYAssistantIvarFingerprints();
-    NSInteger hits = 0;
-    Class c = cls;
-    int depth = 0;
-    while (c && depth < 6) {
-        // ivar
-        unsigned int icount = 0;
-        Ivar *ivars = class_copyIvarList(c, &icount);
-        if (ivars) {
-            for (unsigned int i = 0; i < icount; i++) {
-                const char *nm = ivar_getName(ivars[i]);
-                if (!nm) continue;
-                NSString *low = [@(nm) lowercaseString];
-                for (NSString *p in prints) {
-                    if ([low containsString:p]) {
-                        hits++;
-                        break;
-                    }
-                }
-            }
-            free(ivars);
-        }
-        // method names
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(c, &mcount);
-        if (methods) {
-            for (unsigned int i = 0; i < mcount; i++) {
-                SEL s = method_getName(methods[i]);
-                if (!s) continue;
-                NSString *low = [NSStringFromSelector(s) lowercaseString];
-                for (NSString *p in prints) {
-                    if ([low containsString:p]) {
-                        hits++;
-                        break;
-                    }
-                }
-            }
-            free(methods);
-        }
-        c = class_getSuperclass(c);
-        depth++;
-    }
-    return hits;
-}
-
-static BOOL CYClassLooksLikeAssistant(Class cls) {
-    return CYClassAssistantScore(cls) >= 2;
-}
-
-// 收集类的全部方法名（含父类，最多 6 层），用于远程诊断
-static NSString *CYMethodNamesOfClass(Class cls, NSUInteger limit) {
-    if (!cls) return @"";
-    NSMutableArray *names = [NSMutableArray array];
-    Class c = cls;
-    int depth = 0;
-    while (c && depth < 6) {
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(c, &count);
-        if (methods) {
-            for (unsigned int i = 0; i < count && names.count < limit; i++) {
-                SEL s = method_getName(methods[i]);
-                if (s) [names addObject:NSStringFromSelector(s)];
-            }
-            free(methods);
-        }
-        c = class_getSuperclass(c);
-        depth++;
-    }
-    return [names componentsJoinedByString:@" "];
-}
-
-// 诊断：把每个 tab 的类名 / 标题 / 指纹分 / 方法名全量打进日志
-static void CYDumpTabDiagnostics(NSArray *vcs, NSString *where) {
-    if (!vcs.count) {
-        CYLog(@"[Diag][%@] viewControllers is empty", where);
-        return;
-    }
-    CYLog(@"[Diag][%@] %lu tab(s):", where, (unsigned long)vcs.count);
-    NSUInteger idx = 0;
-    for (UIViewController *vc in vcs) {
-        NSString *clsName = NSStringFromClass([vc class]);
-        NSString *itemTitle = [vc respondsToSelector:@selector(tabBarItem)] ? ([vc tabBarItem].title ?: @"") : @"";
-        NSString *vcTitle = [vc respondsToSelector:@selector(title)] ? ([vc title] ?: @"") : @"";
-        UIViewController *root = CYUnwrapRootViewController(vc);
-        NSString *rootCls = root ? NSStringFromClass([root class]) : @"";
-        NSInteger score = root ? CYClassAssistantScore([root class]) : 0;
-        CYLog(@"[Diag]  #%lu cls=%@ rootCls=%@ itemTitle='%@' vcTitle='%@' score=%ld",
-              (unsigned long)idx, clsName, rootCls, itemTitle, vcTitle, (long)score);
-        // 方法名全量输出，便于确认小助手的真实特征
-        NSString *methods = CYMethodNamesOfClass([vc class], 60);
-        CYLog(@"[Diag]     methods[%@]: %@", clsName, methods);
-        if (root && root != vc) {
-            NSString *rMethods = CYMethodNamesOfClass([root class], 60);
-            CYLog(@"[Diag]     methods[%@](root): %@", rootCls, rMethods);
-        }
-        idx++;
-    }
-}
-
-// 取一个 tab VC 实际呈现在 tabBar 上的 item（兼容 UINavigationController 包装）
-static UITabBarItem *CYEffectiveTabBarItem(id vc) {
-    if (![vc respondsToSelector:@selector(tabBarItem)]) return nil;
-    UITabBarItem *item = [vc tabBarItem];
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        UIViewController *root = [(UINavigationController *)vc viewControllers].firstObject;
-        if (root && root.tabBarItem) {
-            item = root.tabBarItem;
-        }
-    }
-    return item;
-}
-
-static BOOL CYViewControllerIsAssistantTab(id vc) {
-    if (!vc) return NO;
-
-    // 1) tabBarItem.title / 类名明确写着「小助手」
-    // 注意：title 通常设置在 UINavigationController 的 rootViewController 上，
-    // 直接读 [vc tabBarItem].title 会得到空字符串。
-    UITabBarItem *item = CYEffectiveTabBarItem(vc);
-    NSString *title = item.title ?: @"";
-    if (!title.length && [vc respondsToSelector:@selector(title)]) {
-        title = [vc title] ?: @"";
-    }
-    if (title.length && ([title containsString:@"小助手"] || [title containsString:@"助手"])) {
-        CYLog(@"[Tab] filter by title: %@", title);
-        return YES;
-    }
-
-    // 2) 类名含 Assistant/assistant
-    NSString *clsName = NSStringFromClass([vc class]);
-    if ([clsName containsString:@"Assistant"] || [clsName containsString:@"assistant"]) {
-        CYLog(@"[Tab] filter by class: %@", clsName);
-        return YES;
-    }
-
-    // 3) 已知白名单：天气/降水图/我的 都不删，避免误杀
-    static NSSet *whitelist = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        whitelist = [NSSet setWithObjects:
-            @"CYMainController",
-            @"CYMapController", @"CYGaodeMapController", @"CYIOSMapController",
-            @"CYConfigureViewController",
-            @"UINavigationController",
-            nil];
-    });
-    UIViewController *root = CYUnwrapRootViewController(vc);
-    NSString *rootCls = root ? NSStringFromClass([root class]) : @"";
-    if ([whitelist containsObject:clsName] || [whitelist containsObject:rootCls]) {
-        return NO;
-    }
-
-    // 4) 兜底：ivar/method 聊天指纹（只删高度疑似且不在白名单里的）
-    if (root && CYClassLooksLikeAssistant([root class])) {
-        CYLog(@"[Tab] filter by ivar/method fingerprint: %@ (wrapped: %@)",
-              rootCls, clsName);
-        return YES;
-    }
-
-    // 5) 响应 assistantAction（小助手入口常见命名）
-    if ([vc respondsToSelector:NSSelectorFromString(@"assistantAction")]) {
-        CYLog(@"[Tab] filter by assistantAction selector: %@", clsName);
-        return YES;
-    }
-    return NO;
-}
-
+// 从任意对象身上尽量抠出可判定的文案（title / message / text）
 static NSString *CYExtractTitleFromObject(id obj) {
-    if (!obj) return nil;
-    NSArray *getters = @[@"title", @"alertTitle", @"message", @"alertString", @"desc", @"text"];
-    for (NSString *getter in getters) {
-        SEL sel = NSSelectorFromString(getter);
-        if ([obj respondsToSelector:sel]) {
-            id val = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
-            if ([val isKindOfClass:[NSString class]] && [val length]) {
-                return val;
-            }
+    if (!obj) return @"";
+    NSMutableString *s = [NSMutableString string];
+    NSString *selNames[] = {@"title", @"message", @"text", @"content", @"desc"};
+    for (int i = 0; i < 5; i++) {
+        SEL sel = NSSelectorFromString(selNames[i]);
+        if (![obj respondsToSelector:sel]) continue;
+        id v = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+        if ([v isKindOfClass:[NSString class]] && [v length]) {
+            [s appendFormat:@" %@", v];
         }
     }
-    return nil;
+    return s;
 }
 
-// 递归 dump 视图层级，用于找出自定义 tabbar 里的小助手按钮
-static void CYDumpViewHierarchy(UIView *view, int depth, int maxDepth) {
-    if (!view || depth > maxDepth) return;
-    NSString *indent = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-    NSString *cls = NSStringFromClass([view class]);
-    CGRect f = view.frame;
-    NSString *acc = view.accessibilityIdentifier ?: @"";
-    CYLog(@"[Tree]%@%@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d acc='%@'",
-          indent, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
-          view.hidden, acc);
-    // UIButton 额外打标题
-    if ([view isKindOfClass:[UIButton class]]) {
-        NSString *t = [(UIButton *)view currentTitle] ?: @"";
-        CYLog(@"[Tree]%@  -> button title='%@'", indent, t);
-    }
-    for (UIView *sub in view.subviews) {
-        CYDumpViewHierarchy(sub, depth + 1, maxDepth);
-    }
-}
-
-// 找出视图响应链上最近的 UIViewController 类名（Flex 里 Nearest VC 就是这么来的）
-static NSString *CYNearestViewControllerName(UIView *view) {
-    UIResponder *r = view;
-    int guard = 0;
-    while (r && guard < 20) {
-        if ([r isKindOfClass:[UIViewController class]]) break;
-        r = [r nextResponder];
-        guard++;
-    }
-    return r ? NSStringFromClass([r class]) : @"(none)";
-}
-
-// 只打印位于屏幕底部区域的视图（自定义 tabbar 就在那儿），避免整棵树刷屏
-static void CYDumpBottomViews(UIView *view, CGFloat bottomY, int depth) {
-    if (!view || depth > 12) return;
-    CGRect f = view.frame;
-    // 视图本身或其底边落在底部区域 → 打印
-    BOOL inBottom = (f.origin.y >= bottomY) || (f.origin.y + f.size.height >= bottomY);
-    if (inBottom) {
-        NSString *indent = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-        NSString *cls = NSStringFromClass([view class]);
-        CYLog(@"[Bottom]%@%@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d a=%.2f tag=%ld acc='%@' vc=%@",
-              indent, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
-              view.hidden, view.alpha, (long)view.tag,
-              view.accessibilityIdentifier ?: @"", CYNearestViewControllerName(view));
-        if ([view isKindOfClass:[UIButton class]]) {
-            UIButton *b = (UIButton *)view;
-            CYLog(@"[Bottom]%@  -> btn title='%@' img=%@",
-                  indent, [b currentTitle] ?: @"", [b currentImage] ?: (id)@"nil");
-        }
-        if ([view isKindOfClass:[UILabel class]]) {
-            CYLog(@"[Bottom]%@  -> label='%@'", indent, [(UILabel *)view text] ?: @"");
-        }
-        if ([view isKindOfClass:[UIImageView class]]) {
-            UIImageView *iv = (UIImageView *)view;
-            CYLog(@"[Bottom]%@  -> img %@ hl=%d",
-                  indent, iv.image ? NSStringFromCGSize(iv.image.size) : @"nil", iv.highlighted);
-        }
-        if ([view isKindOfClass:[UITabBar class]]) {
-            CYLog(@"[Bottom]%@  -> tabBar items=%lu",
-                  indent, (unsigned long)([(UITabBar *)view items] ?: @[]).count);
-        }
-    }
-    for (UIView *sub in view.subviews) {
-        CYDumpBottomViews(sub, bottomY, depth + 1);
-    }
-}
-
-// 遍历所有 window（自定义 tabbar 可能挂在独立 window 上），把底部区域挖出来
-static void CYDumpTabBarArea(void) {
-    NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in [(UIWindowScene *)scene windows]) {
-                [wins addObject:w];
-            }
-        }
-    }
-    if (!wins.count) {
-        UIWindow *kw = UIApplication.sharedApplication.keyWindow;
-        if (kw) [wins addObject:kw];
-    }
-    if (!wins.count) { CYLog(@"[Bottom] NO WINDOW FOUND"); return; }
-
-    CYLog(@"[Bottom] === windows=%lu ===", (unsigned long)wins.count);
-    for (UIWindow *win in wins) {
-        CGFloat h = win.bounds.size.height;
-        CGFloat bottomY = h - 170.0;
-        CYLog(@"[Bottom] --- win=%@ frame=(%.0f,%.0f,%.0f,%.0f) key=%d lvl=%.0f bottomY=%.0f ---",
-              NSStringFromClass([win class]), win.frame.origin.x, win.frame.origin.y,
-              win.frame.size.width, win.frame.size.height, win.isKeyWindow,
-              win.windowLevel, bottomY);
-        CYDumpBottomViews(win, bottomY, 0);
-        CYLog(@"[Bottom] --- end win=%@ ---", NSStringFromClass([win class]));
-    }
-    CYLog(@"[Bottom] === dump end ===");
-}
-
-// 运行时反射：把某个类的 ivar / method 全列出来（找自定义 tabbar 的实现入口）
-static void CYDumpClassRuntimeInfo(Class cls) {
-    if (!cls) return;
-    CYLog(@"[Reflect] ==== %@ ====", NSStringFromClass(cls));
-
-    // ivar：从本类一路往上挖 4 层
-    Class c = cls;
-    int level = 0;
-    while (c && level < 4) {
-        unsigned int n = 0;
-        Ivar *list = class_copyIvarList(c, &n);
-        if (n) {
-            CYLog(@"[Reflect] -- ivars of %@ (%u) --", NSStringFromClass(c), n);
-            for (unsigned int i = 0; i < n; i++) {
-                NSString *name = @(ivar_getName(list[i]) ?: "");
-                NSString *type = @(ivar_getTypeEncoding(list[i]) ?: "");
-                CYLog(@"[Reflect]    %@ : %@", name, type);
-            }
-        }
-        free(list);
-        c = class_getSuperclass(c);
-        level++;
-    }
-
-    // method：只看本类
-    unsigned int m = 0;
-    Method *ms = class_copyMethodList(cls, &m);
-    CYLog(@"[Reflect] -- methods of %@ (%u) --", NSStringFromClass(cls), m);
-    for (unsigned int i = 0; i < m; i++) {
-        CYLog(@"[Reflect]    %@", NSStringFromSelector(method_getName(ms[i])));
-    }
-    free(ms);
-    CYLog(@"[Reflect] ==== end %@ ====", NSStringFromClass(cls));
-}
-
+// 兜底判定：present 出来的 VC 是否属于会员推广弹窗
 static BOOL CYObjectIsAdPopup(id obj) {
     if (!obj) return NO;
-    NSString *combined = @"";
-    NSString *t = CYExtractTitleFromObject(obj);
-    if (t.length) combined = [combined stringByAppendingString:t];
-    if ([obj isKindOfClass:NSClassFromString(@"UIAlertController")]) {
-        NSString *title = [(UIAlertController *)obj title] ?: @"";
-        NSString *msg = [(UIAlertController *)obj message] ?: @"";
-        combined = [combined stringByAppendingFormat:@" %@ %@", title, msg];
+    NSString *cls = NSStringFromClass([obj class]);
+    // 类名层面的硬判定（开屏付费弹窗 / 会员推广视图）
+    if ([cls containsString:@"PayLaunchView"] ||
+        [cls containsString:@"MemberToastView"] ||
+        [cls containsString:@"SvipToastView"] ||
+        [cls containsString:@"SVIPBottomToastView"]) {
+        CYLog(@"[AdPopup] block by class: %@", cls);
+        return YES;
     }
-    if (CYStringContainsAdKeyword(combined)) {
-        CYLog(@"[AdPopup] block %@ text=%@", NSStringFromClass([obj class]), combined);
+    // 文案层面的判定
+    NSString *text = CYExtractTitleFromObject(obj);
+    if (CYStringContainsAdKeyword(text)) {
+        CYLog(@"[AdPopup] block by keyword: %@ text=%@", cls, text);
         return YES;
     }
     return NO;
 }
 
-// 小助手的实现：CYTabBarController 自定义底部栏里的 chatButton（核心手段在下面）
-// 说明：早期版本这里按 ivar 指纹过滤 viewControllers，结果把「天气」和「我的」
-// 两个 tab 一起判成小助手删光，UITabBarController 0 个 VC → 启动闪退。
-// 已经确认小助手不是系统 tab，所以下面的 setter 只做观察，绝不动数组。
+#pragma mark - 小助手：隐藏底栏按钮（兜底）
 
-// 诊断：把底部栏的结构打出来，判断隐藏小助手后是否需要重新排版
-static void CYDumpBottomBar(id tbc) {
-    @try {
-        id bar = [tbc valueForKey:@"bottomBarView"];
-        if (![bar isKindOfClass:[UIView class]]) {
-            CYLog(@"[Bar] bottomBarView nil or not a view (%@)", bar ? NSStringFromClass([bar class]) : @"nil");
-            return;
-        }
-        UIView *v = (UIView *)bar;
-        CYLog(@"[Bar] bottomBarView=%@ f=(%.0f,%.0f,%.0f,%.0f) subs=%lu",
-              NSStringFromClass([v class]), v.frame.origin.x, v.frame.origin.y,
-              v.frame.size.width, v.frame.size.height, (unsigned long)v.subviews.count);
-        for (UIView *s in v.subviews) {
-            NSString *extra = @"";
-            if ([s isKindOfClass:[UIButton class]]) extra = [(UIButton *)s currentTitle] ?: @"";
-            if ([s isKindOfClass:[UILabel class]]) extra = [(UILabel *)s text] ?: @"";
-            CYLog(@"[Bar]   sub %@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d tag=%ld '%@'",
-                  NSStringFromClass([s class]), s.frame.origin.x, s.frame.origin.y,
-                  s.frame.size.width, s.frame.size.height, s.hidden, (long)s.tag, extra);
-        }
-    } @catch (NSException *e) {
-        CYLog(@"[Bar] dump failed: %@", e.reason);
-    }
-}
-
-// 把底部栏里的小助手按钮（及其背景）隐藏掉。用 KVC 取属性，不依赖具体类型。
+// 主手段是 isShowChat 返回 NO；这里是保险——万一 App 绕开配置直接创建了按钮，
+// 在底栏每次刷新后把它按下去。用 KVC 取属性，不依赖具体类型。
 static void CYHideChatButton(id tbc, NSString *when) {
     if (!tbc) return;
     @try {
         id chatBtn = [tbc valueForKey:@"chatButton"];
         id chatBg  = [tbc valueForKey:@"chatBtnBgView"];
         BOOL changed = NO;
-        if ([chatBtn isKindOfClass:[UIView class]]) {
-            UIView *v = (UIView *)chatBtn;
-            if (!v.hidden) {
-                v.hidden = YES;
-                changed = YES;
-            }
+        if ([chatBtn isKindOfClass:[UIView class]] && !((UIView *)chatBtn).hidden) {
+            ((UIView *)chatBtn).hidden = YES;
+            changed = YES;
         }
-        if ([chatBg isKindOfClass:[UIView class]]) {
-            UIView *v = (UIView *)chatBg;
-            if (!v.hidden) {
-                v.hidden = YES;
-                changed = YES;
-            }
+        if ([chatBg isKindOfClass:[UIView class]] && !((UIView *)chatBg).hidden) {
+            ((UIView *)chatBg).hidden = YES;
+            changed = YES;
         }
         if (changed) {
-            CYLog(@"[CYTabBar] hid chatButton via %@ (btn=%@ bg=%@)", when,
+            CYLog(@"[Chat] hid chatButton via %@ (btn=%@ bg=%@)", when,
                   chatBtn ? NSStringFromClass([chatBtn class]) : @"nil",
                   chatBg ? NSStringFromClass([chatBg class]) : @"nil");
         }
     } @catch (NSException *e) {
-        CYLog(@"[CYTabBar] KVC chatButton failed @%@: %@", when, e.reason);
+        CYLog(@"[Chat] KVC chatButton failed @%@: %@", when, e.reason);
     }
 }
 
-%hook UITabBarController
-
-- (void)setViewControllers:(NSArray *)viewControllers animated:(BOOL)animated {
-    CYLog(@"[UITabBarController] setViewControllers:animated: (%lu)", (unsigned long)viewControllers.count);
-    %orig(viewControllers, animated);
-}
-
-- (void)setViewControllers:(NSArray *)viewControllers {
-    CYLog(@"[UITabBarController] setViewControllers: (%lu)", (unsigned long)viewControllers.count);
-    %orig(viewControllers);
-}
-
-%end
-
-#pragma mark - CYTabBarController：兜底过滤
+#pragma mark - CYTabBarController：去小助手（实测命中的主链路）
 
 %hook CYTabBarController
 
-// 小助手不是 tab，是 CYTabBarController 底部栏 bottomBarView 里的一个 chatButton。
-// 所以 viewControllers 一个都别动——只观察，不再过滤（早期版本误删导致 0 个 VC 直接闪退）。
-- (void)setViewControllers:(NSArray *)viewControllers animated:(BOOL)animated {
-    CYLog(@"[CYTabBarController] setViewControllers:animated: (%lu)", (unsigned long)viewControllers.count);
-    %orig(viewControllers, animated);
-}
-
-- (void)setViewControllers:(NSArray *)viewControllers {
-    CYLog(@"[CYTabBarController] setViewControllers: (%lu)", (unsigned long)viewControllers.count);
-    %orig(viewControllers);
-}
-
-// ① 配置层：永远否认需要显示小助手
+// ① 配置层：App 启动时用服务端下发的开关调 setIsShowChat:YES，这里强制改写成 NO，
+//    App 自己就不会创建小助手按钮，底栏自动三等分——这是真正生效的一招。
 - (BOOL)isShowChat {
     return NO;
 }
 
 - (void)setIsShowChat:(BOOL)show {
-    CYLog(@"[CYTabBar] setIsShowChat:%d -> force NO", show);
+    CYLog(@"[Chat] setIsShowChat:%d -> force NO", show);
     %orig(NO);
 }
 
-// ② UI 层：底部栏每次重建/刷新后，把小助手按钮按下去（KVC 拿属性，避免类型耦合）
+// ② UI 层兜底：底栏每次重建/刷新后再压一次，防 App 绕开配置直接建按钮
 - (void)refreshShowChat {
     %orig;
     CYHideChatButton(self, @"refreshShowChat");
@@ -592,219 +184,87 @@ static void CYHideChatButton(id tbc, NSString *when) {
     CYHideChatButton(self, @"refreshMyButton");
 }
 
-// ③ 防呆：任何跳小助手的入口（deeplink / 推送 / 活动）都掐掉
-- (void)goChat {
-    CYLog(@"[CYTabBar] goChat blocked");
-    return;
-}
-
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
     CYHideChatButton(self, @"viewDidAppear");
-    CYLog(@"[CYTabBar] tabs=%lu", (unsigned long)self.viewControllers.count);
-    static BOOL dumped = NO;
-    if (!dumped) {
-        dumped = YES;
-        CYDumpBottomBar(self);
-    }
 }
 
-%end
-
-#pragma mark - CYMainController：dump 视图层级找自定义 tabbar
-
-%hook CYMainController
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig(animated);
-    // 只在每次进程内首次出现时 dump，避免刷屏
-    static BOOL dumped = NO;
-    if (dumped) return;
-    dumped = YES;
-
-    CYLog(@"[Tree] === CYMainController view hierarchy ===");
-    CYLog(@"[Tree] self=%@ view=%@", NSStringFromClass([self class]),
-          NSStringFromClass([self.view class]));
-
-    // 子/弹出控制器
-    NSArray *children = self.childViewControllers ?: @[];
-    CYLog(@"[Tree] childViewControllers=%lu", (unsigned long)children.count);
-    for (UIViewController *c in children) {
-        CYLog(@"[Tree]   child: %@", NSStringFromClass([c class]));
-    }
-    if (self.presentedViewController) {
-        CYLog(@"[Tree]   presented: %@", NSStringFromClass([self.presentedViewController class]));
-    }
-
-    // 只记结构，不再整树 dump（太冗长且 tabbar 不在这一层）
-    CYLog(@"[Tree] view=%@ subviews=%lu",
-          NSStringFromClass([self.view class]), (unsigned long)self.view.subviews.count);
-    for (UIView *sv in self.view.subviews) {
-        CYLog(@"[Tree]   sub[%@] f=(%.0f,%.0f,%.0f,%.0f) subs=%lu",
-              NSStringFromClass([sv class]), sv.frame.origin.x, sv.frame.origin.y,
-              sv.frame.size.width, sv.frame.size.height, (unsigned long)sv.subviews.count);
-    }
-    CYLog(@"[Tree] === end ===");
-}
-
-// 底部四个按钮的点击回调就走这里，先记录下每个按钮对应的 type 值
-- (void)tabbarSelectType:(long long)type isClickTabbar:(BOOL)clicked {
-    CYLog(@"[Tabbar] tabbarSelectType:%lld isClickTabbar:%d", type, clicked);
-    %orig(type, clicked);
-}
-
-%end
-
-#pragma mark - CYPopupModel：首页弹窗/活动弹窗
-
-%hook _TtC17ColorfulCloudsPro12CYPopupModel
-
-- (void)handlePopupArray:(id)array {
-    CYLog(@"[CYPopupModel] handlePopupArray blocked");
-    return;
-}
-
-- (void)handlePopupModel:(id)model {
-    CYLog(@"[CYPopupModel] handlePopupModel blocked");
-    return;
-}
-
-- (void)handleWithPopupId:(id)popupId pageId:(id)pageId completion:(id)completion {
-    CYLog(@"[CYPopupModel] handleWithPopupId:pageId:completion: blocked");
-    if (completion) {
-        // 尽量安全调用 completion，避免业务逻辑卡死
-        // block 签名未知，用 NSInvocation 太麻烦；对于弹窗 completion 通常可空过
-    }
-    return;
-}
-
-- (void)handleWithPopupId:(id)popupId pageId:(id)pageId isHotLaunch:(BOOL)isHotLaunch completion:(id)completion {
-    CYLog(@"[CYPopupModel] handleWithPopupId:pageId:isHotLaunch:completion: blocked");
-    return;
-}
-
-- (void)handleNextPopup {
-    CYLog(@"[CYPopupModel] handleNextPopup blocked");
+// ③ 防呆：deeplink / 推送 / 活动位可能直接调 goChat 进小助手
+- (void)goChat {
+    CYLog(@"[Chat] goChat blocked");
     return;
 }
 
 %end
 
-#pragma mark - CYADLaunchViewController：启动广告
+#pragma mark - CYADLaunchViewController：开屏广告（含 SVIP 付费开屏）
 
 %hook CYADLaunchViewController
 
-- (instancetype)init {
-    CYLog(@"[CYADLaunchViewController] init blocked -> nil");
-    return nil;
+// 只掐"请求 / 加载 / 预加载"这类无返回值的入口，绝不动带 completion 的方法：
+// 不回调 completion 会让 App 卡在开屏流程上。
+- (void)requestADInfoWithIsHot:(BOOL)isHot hotArray:(NSArray *)hotArray {
+    CYLog(@"[ADLaunch] requestADInfoWithIsHot:%d blocked", isHot);
+    return;
 }
 
-- (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil {
-    CYLog(@"[CYADLaunchViewController] initWithNibName blocked -> nil");
-    return nil;
+- (void)loadADwithDict:(id)dict isHot:(BOOL)isHot {
+    CYLog(@"[ADLaunch] loadADwithDict blocked");
+    return;
 }
 
-- (instancetype)initWithCoder:(NSCoder *)coder {
-    CYLog(@"[CYADLaunchViewController] initWithCoder blocked -> nil");
-    return nil;
+- (void)preloadArray:(id)array {
+    CYLog(@"[ADLaunch] preloadArray blocked");
+    return;
 }
 
 %end
 
-#pragma mark - CYADFactory / CYMainADModel：广告数据加载（兜底）
+#pragma mark - CYADFactory：插屏 / 信息流 / 通用广告位
 
 %hook CYADFactory
 
-- (id)createAdvertisingRequestURL:(id)arg1 type:(id)arg2 {
-    CYLog(@"[CYADFactory] createAdvertisingRequestURL blocked");
-    return nil;
+- (void)requestInsertADWithModel:(id)model {
+    CYLog(@"[ADFactory] requestInsertAD blocked");
+    return;
 }
 
-%end
-
-%hook CYMainADModel
-
-- (id)init {
-    CYLog(@"[CYMainADModel] init blocked -> nil");
-    return nil;
+- (void)requestInfoflowWithModel:(id)model {
+    CYLog(@"[ADFactory] requestInfoflow blocked");
+    return;
 }
 
-%end
-
-#pragma mark - CYAlertView / CYAlertContentView：弹窗展示
-
-%hook CYAlertView
-
-- (void)show {
-    if (CYObjectIsAdPopup(self)) {
-        CYLog(@"[CYAlertView] show blocked");
-        return;
-    }
-    %orig;
+- (void)requestRewardVideoWithModel:(id)model {
+    CYLog(@"[ADFactory] requestRewardVideo blocked");
+    return;
 }
 
-- (void)showAlert:(id)arg1 {
-    if (CYObjectIsAdPopup(self) || CYObjectIsAdPopup(arg1)) {
-        CYLog(@"[CYAlertView] showAlert: blocked");
-        return;
-    }
-    %orig(arg1);
-}
-
-- (void)showAlert:(id)arg1 showClose:(BOOL)showClose {
-    if (CYObjectIsAdPopup(self) || CYObjectIsAdPopup(arg1)) {
-        CYLog(@"[CYAlertView] showAlert:showClose: blocked");
-        return;
-    }
-    %orig(arg1, showClose);
-}
-
-%end
-
-%hook CYAlertContentView
-
-- (void)show {
-    if (CYObjectIsAdPopup(self)) {
-        CYLog(@"[CYAlertContentView] show blocked");
-        return;
-    }
-    %orig;
-}
-
-%end
-
-#pragma mark - CYThemeAdView：主题广告位
-
-%hook CYThemeAdView
-
-- (instancetype)init {
-    CYLog(@"[CYThemeAdView] init blocked -> nil");
-    return nil;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    CYLog(@"[CYThemeAdView] initWithFrame blocked -> nil");
-    return nil;
-}
-
-%end
-
-#pragma mark - CYToastViewController / CYToastView：会员提示 Toast
-
-%hook CYToastViewController
-
-- (void)showMemberText:(id)arg1 {
-    CYLog(@"[CYToastViewController] showMemberText: blocked");
+- (void)requestADWithModel:(id)model bottomView:(id)bottomView backgroundImage:(id)image {
+    CYLog(@"[ADFactory] requestAD blocked");
     return;
 }
 
 %end
 
-%hook CYToastView
+#pragma mark - 开屏付费弹窗：出现即隐藏
 
-- (void)showMemberText:(id)arg1 {
-    CYLog(@"[CYToastView] showMemberText: blocked");
-    return;
+// CYPayLaunchView / CYPayLaunchOtherView 是纯广告视图，不属于正常页面，
+// 挂到 window 上就直接隐藏，不影响会员中心等正常业务页。
+static BOOL CYIsAdViewClassName(NSString *cls) {
+    if (!cls.length) return NO;
+    if ([cls hasSuffix:@"CYPayLaunchView"]) return YES;
+    if ([cls hasSuffix:@"CYPayLaunchOtherView"]) return YES;
+    return NO;
+}
+
+%hook UIView
+
+- (void)didMoveToWindow {
+    %orig;
+    if (self.window && CYIsAdViewClassName(NSStringFromClass([self class]))) {
+        CYLog(@"[AdView] hid %@", NSStringFromClass([self class]));
+        self.hidden = YES;
+    }
 }
 
 %end
@@ -823,135 +283,54 @@ static void CYHideChatButton(id tbc, NSString *when) {
 
 %end
 
-#pragma mark - UIViewController present 兜底
+#pragma mark - present 兜底
 
 %hook UIViewController
 
-- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
-    if (CYObjectIsAdPopup(viewControllerToPresent)) {
-        CYLog(@"[presentViewController] blocked ad popup: %@", NSStringFromClass([viewControllerToPresent class]));
+- (void)presentViewController:(UIViewController *)vc animated:(BOOL)flag completion:(void (^)(void))completion {
+    if (CYObjectIsAdPopup(vc)) {
+        CYLog(@"[present] blocked ad popup: %@", NSStringFromClass([vc class]));
         if (completion) completion();
         return;
     }
-    %orig(viewControllerToPresent, flag, completion);
+    %orig(vc, flag, completion);
 }
 
 %end
 
-#pragma mark - Swift 类的运行时 hook（真正的 tabbar 与小助手页面）
+#pragma mark - Swift 弹窗模型：拦掉所有 handle* 方法
 
-// 真正的底部 tabbar 是 Swift 类 ColorfulCloudsPro.CYSystemTabBarController，
-// 小助手页面是 ColorfulCloudsPro.CYChatViewController。
-// Swift 类名带模块点号，Logos 的 %hook 会生成 `@class ColorfulCloudsPro.Xxx;`
-// 这种非法声明，所以一律走 objc_getClass + MSHookMessageEx。
-
-static BOOL CYIsChatAssistantVC(id vc) {
-    if (!vc) return NO;
-    NSString *cls = NSStringFromClass([vc class]);
-    if (!cls.length) return NO;
-    // 包一层 UINavigationController 的情况
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        for (UIViewController *c in [(UINavigationController *)vc viewControllers]) {
-            if (CYIsChatAssistantVC(c)) return YES;
-        }
-    }
-    if ([cls hasSuffix:@"CYChatViewController"]) return YES;
-    if ([cls hasSuffix:@"CYChatManager"]) return YES;
-    return NO;
+// CYPopupModel 是 Swift 类，运行时名带模块前缀。之前写成
+// %hook _TtC17ColorfulCloudsPro12CYPopupModel 是错的（objc_getClass 返回 nil，hook 静默失效）。
+// 这里在运行时枚举方法，把返回值为 void 的 handle* 全替换成空实现。
+static void CYBlackhole(id self, SEL _cmd) {
+    CYLog(@"[Popup] blocked %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
 }
 
-static NSArray *CYFilterAssistantTabs(NSArray *vcs, NSString *tag) {
-    if (!vcs.count) return vcs;
-    CYLog(@"[SwiftTab] %@ incoming=%lu", tag, (unsigned long)vcs.count);
-    for (id vc in vcs) {
-        NSString *cls = NSStringFromClass([vc class]);
-        NSString *title = @"";
-        if ([vc respondsToSelector:@selector(tabBarItem)]) {
-            title = [(UIViewController *)vc tabBarItem].title ?: @"";
-        }
-        CYLog(@"[SwiftTab]   %@ title='%@' match=%d", cls, title, CYIsChatAssistantVC(vc));
-    }
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in vcs) {
-        if (CYIsChatAssistantVC(vc)) {
-            CYLog(@"[SwiftTab] %@ REMOVE assistant tab: %@", tag, NSStringFromClass([vc class]));
+static void CYHookVoidHandleMethods(Class cls) {
+    if (!cls) return;
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(cls, &n);
+    if (!ms) return;
+    int hooked = 0;
+    for (unsigned int i = 0; i < n; i++) {
+        SEL sel = method_getName(ms[i]);
+        NSString *name = NSStringFromSelector(sel);
+        if (![name.lowercaseString hasPrefix:@"handle"]) continue;
+        char ret[16];
+        method_getReturnType(ms[i], ret, sizeof(ret));
+        if (ret[0] != 'v') {           // 只动返回 void 的，避免破坏 getter
+            CYLog(@"[Popup] skip non-void %@", name);
             continue;
         }
-        [filtered addObject:vc];
+        method_setImplementation(ms[i], (IMP)&CYBlackhole);
+        CYLog(@"[Popup] hooked %@ %@", NSStringFromClass(cls), name);
+        hooked++;
     }
-    return filtered.count ? filtered.copy : vcs;  // 全删光会让 tabbar 崩，保底不删
+    free(ms);
+    CYLog(@"[Popup] %@: %d handle* method(s) blocked", NSStringFromClass(cls), hooked);
 }
 
-static void (*orig_CYSystem_setVCs_animated)(id self, SEL _cmd, NSArray *vcs, BOOL animated);
-static void hook_CYSystem_setVCs_animated(id self, SEL _cmd, NSArray *vcs, BOOL animated) {
-    NSArray *filtered = CYFilterAssistantTabs(vcs, @"setViewControllers:animated:");
-    orig_CYSystem_setVCs_animated(self, _cmd, filtered, animated);
-}
-
-static void (*orig_CYSystem_setVCs)(id self, SEL _cmd, NSArray *vcs);
-static void hook_CYSystem_setVCs(id self, SEL _cmd, NSArray *vcs) {
-    NSArray *filtered = CYFilterAssistantTabs(vcs, @"setViewControllers:");
-    orig_CYSystem_setVCs(self, _cmd, filtered);
-}
-
-// 兜底：tab 若不是走 setter 赋值的，界面出现后再清一次；顺带 dump 一次真实 tab 列表
-static void (*orig_CYSystem_viewDidAppear)(id self, SEL _cmd, BOOL animated);
-static void hook_CYSystem_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    orig_CYSystem_viewDidAppear(self, _cmd, animated);
-    static BOOL once = NO;
-    if (once) return;
-    once = YES;
-    NSArray *vcs = [(UITabBarController *)self viewControllers];
-    CYLog(@"[SwiftTab] viewDidAppear tabs=%lu", (unsigned long)vcs.count);
-    for (id vc in vcs) {
-        CYLog(@"[SwiftTab]   live: %@ title='%@'", NSStringFromClass([vc class]),
-              [vc respondsToSelector:@selector(tabBarItem)] ? ([(UIViewController *)vc tabBarItem].title ?: @"") : @"");
-    }
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in vcs) {
-        if (CYIsChatAssistantVC(vc)) continue;
-        [filtered addObject:vc];
-    }
-    if (filtered.count && filtered.count != vcs.count) {
-        CYLog(@"[SwiftTab] viewDidAppear cleanup: %lu -> %lu",
-              (unsigned long)vcs.count, (unsigned long)filtered.count);
-        [(UITabBarController *)self setViewControllers:filtered.copy animated:NO];
-    }
-}
-
-// 小助手页面兜底：只记录，不做隐藏/切 tab。
-// 上一版在这里 hidden + 强制 selectedIndex=0，结果：
-//   ① 启动时 CYChatViewController 就被预加载 viewDidAppear，直接把首屏搞黑；
-//   ② 切 tab 又触发一次，和 App 自身切换逻辑打成 101<->100 死循环。
-// 真正的入口在 CYTabBarController 的 chatButton 上，那儿掐掉就够了。
-static void (*orig_CYChat_viewDidAppear)(id self, SEL _cmd, BOOL animated);
-static void hook_CYChat_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    CYLog(@"[CYChat] viewDidAppear (log only)");
-    orig_CYChat_viewDidAppear(self, _cmd, animated);
-}
-
-// 探测环境里到底有哪些 tabbar / chat 相关类，确认 Swift 类名与继承链
-static void CYProbeClasses(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)n);
-    n = objc_getClassList(classes, n);
-    CYLog(@"[Probe] total classes=%d", n);
-    for (int i = 0; i < n; i++) {
-        NSString *name = NSStringFromClass(classes[i]);
-        NSString *lo = name.lowercaseString;
-        if ([lo containsString:@"tabbar"] ||
-            [lo hasPrefix:@"colorfulcloudspro.cychat"] ||
-            [lo containsString:@"assistant"] ||
-            [lo containsString:@"colorfulcloudspro.cymain"] ||
-            [lo containsString:@"colorfulcloudspro.cyconfigure"]) {
-            CYLog(@"[Probe] %@  super=%@", name, NSStringFromClass(class_getSuperclass(classes[i])));
-        }
-    }
-    free(classes);
-}
-
-// Swift 类运行时名通常带模块前缀，少数情况下只剩 mangled 名，两种都试一遍
 static Class CYFindClass(NSArray<NSString *> *candidates) {
     for (NSString *n in candidates) {
         Class c = objc_getClass(n.UTF8String);
@@ -963,39 +342,15 @@ static Class CYFindClass(NSArray<NSString *> *candidates) {
     return Nil;
 }
 
-static void CYInstallSwiftHooks(void) {
-    CYProbeClasses();
-
-    Class sysTab = CYFindClass(@[@"ColorfulCloudsPro.CYSystemTabBarController",
-                                 @"_TtC17ColorfulCloudsPro24CYSystemTabBarController",
-                                 @"CYSystemTabBarController"]);
-    if (sysTab) {
-        CYLog(@"[SwiftHook] found CYSystemTabBarController");
-        MSHookMessageEx(sysTab, @selector(setViewControllers:animated:),
-                        (IMP)&hook_CYSystem_setVCs_animated, (IMP *)&orig_CYSystem_setVCs_animated);
-        MSHookMessageEx(sysTab, @selector(setViewControllers:),
-                        (IMP)&hook_CYSystem_setVCs, (IMP *)&orig_CYSystem_setVCs);
-        MSHookMessageEx(sysTab, @selector(viewDidAppear:),
-                        (IMP)&hook_CYSystem_viewDidAppear, (IMP *)&orig_CYSystem_viewDidAppear);
-    } else {
-        CYLog(@"[SwiftHook] CYSystemTabBarController NOT FOUND");
-    }
-
-    Class chat = CYFindClass(@[@"ColorfulCloudsPro.CYChatViewController",
-                               @"_TtC17ColorfulCloudsPro20CYChatViewController",
-                               @"CYChatViewController"]);
-    if (chat) {
-        CYLog(@"[SwiftHook] found CYChatViewController");
-        MSHookMessageEx(chat, @selector(viewDidAppear:),
-                        (IMP)&hook_CYChat_viewDidAppear, (IMP *)&orig_CYChat_viewDidAppear);
-    } else {
-        CYLog(@"[SwiftHook] CYChatViewController NOT FOUND");
-    }
-}
-
-#pragma mark - _ctor
-
 %ctor {
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
-    CYInstallSwiftHooks();
+
+    Class popup = CYFindClass(@[@"ColorfulCloudsPro.CYPopupModel",
+                                @"_TtC17ColorfulCloudsPro12CYPopupModel",
+                                @"CYPopupModel"]);
+    if (popup) {
+        CYHookVoidHandleMethods(popup);
+    } else {
+        CYLog(@"[SwiftHook] CYPopupModel NOT FOUND");
+    }
 }
