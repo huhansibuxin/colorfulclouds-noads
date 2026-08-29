@@ -68,32 +68,103 @@ static BOOL CYStringContainsAdKeyword(NSString *text) {
     return NO;
 }
 
+// 小助手（AI 聊天）功能的 ivar 指纹。
+// 这些名字来自二进制 __swift5_reflstr 中 Swift 类的存储属性名，
+// 是小助手聊天界面/ViewModel 独有的，天气与降水图页面不会命中。
+static NSArray<NSString *> *CYAssistantIvarFingerprints(void) {
+    static NSArray *arr = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        arr = @[@"chatinputview", @"chatarray", @"chattableview", @"chatinputbar",
+                @"promptarray", @"historyStatus", @"isrequesthistroy",
+                @"ailabel", @"chatmodel", @"chatimgview", @"chatimages",
+                @"assistant", @"chattextview"];
+    });
+    return arr;
+}
+
+// 扫描类及其所有父类（最多 6 层）的 ivar 列表，命中 >=2 个指纹即判定为小助手
+static BOOL CYClassLooksLikeAssistant(Class cls) {
+    if (!cls) return NO;
+    NSArray *prints = CYAssistantIvarFingerprints();
+    NSInteger hits = 0;
+    Class c = cls;
+    int depth = 0;
+    while (c && depth < 6) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(c, &count);
+        if (ivars) {
+            for (unsigned int i = 0; i < count; i++) {
+                const char *nm = ivar_getName(ivars[i]);
+                if (!nm) continue;
+                NSString *low = [@(nm) lowercaseString];
+                for (NSString *p in prints) {
+                    if ([low containsString:p]) {
+                        hits++;
+                        break; // 同一个 ivar 只计一次
+                    }
+                }
+            }
+            free(ivars);
+        }
+        if (hits >= 2) {
+            return YES;
+        }
+        c = class_getSuperclass(c);
+        depth++;
+    }
+    return NO;
+}
+
+// 解开可能存在的 UINavigationController 包装，取真正的根 VC
+static UIViewController *CYUnwrapRootViewController(UIViewController *vc) {
+    UIViewController *cur = vc;
+    int guard = 0;
+    while (cur && guard < 5) {
+        if ([cur isKindOfClass:[UINavigationController class]]) {
+            cur = [(UINavigationController *)cur viewControllers].firstObject;
+            guard++;
+            continue;
+        }
+        break;
+    }
+    return cur;
+}
+
 static BOOL CYViewControllerIsAssistantTab(id vc) {
     if (!vc) return NO;
-    // 优先通过 tabBarItem.title 判断
+
+    // 1) tabBarItem.title 明确写着「小助手」
     NSString *title = nil;
     if ([vc respondsToSelector:@selector(tabBarItem)]) {
-        UITabBarItem *item = [vc tabBarItem];
-        title = item.title;
+        title = [vc tabBarItem].title;
     }
     if (!title.length && [vc respondsToSelector:@selector(title)]) {
         title = [vc title];
     }
-    if (title.length) {
-        if ([title containsString:@"小助手"] || [title containsString:@"助手"]) {
-            CYLog(@"[Tab] filter by title: %@", title);
-            return YES;
-        }
-    }
-    // 通过类名判断
-    NSString *cls = NSStringFromClass([vc class]);
-    if ([cls containsString:@"Assistant"] || [cls containsString:@"assistant"]) {
-        CYLog(@"[Tab] filter by class: %@", cls);
+    if (title.length && ([title containsString:@"小助手"] || [title containsString:@"助手"])) {
+        CYLog(@"[Tab] filter by title: %@", title);
         return YES;
     }
-    // 通过是否响应 assistantAction 判断（小助手功能入口常见命名）
+
+    // 2) 类名含 Assistant/assistant
+    NSString *clsName = NSStringFromClass([vc class]);
+    if ([clsName containsString:@"Assistant"] || [clsName containsString:@"assistant"]) {
+        CYLog(@"[Tab] filter by class: %@", clsName);
+        return YES;
+    }
+
+    // 3) ivar 指纹扫描（解开 nav 包装后判断，Swift 类名未知也能命中）
+    UIViewController *root = CYUnwrapRootViewController(vc);
+    if (root && CYClassLooksLikeAssistant([root class])) {
+        CYLog(@"[Tab] filter by ivar fingerprint: %@ (wrapped: %@)",
+              NSStringFromClass([root class]), clsName);
+        return YES;
+    }
+
+    // 4) 响应 assistantAction（小助手入口常见命名）
     if ([vc respondsToSelector:NSSelectorFromString(@"assistantAction")]) {
-        CYLog(@"[Tab] filter by assistantAction selector: %@", cls);
+        CYLog(@"[Tab] filter by assistantAction selector: %@", clsName);
         return YES;
     }
     return NO;
@@ -167,6 +238,25 @@ static BOOL CYObjectIsAdPopup(id obj) {
         CYLog(@"[CYTabBarController] removed %lu assistant tab(s)", (unsigned long)(viewControllers.count - filtered.count));
     }
     %orig(filtered.copy, animated);
+}
+
+// 兜底：如果 tab 不是走 setter 初始化的（例如直接赋值 ivar），在界面出现后再清一次
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    NSArray *vcs = self.viewControllers;
+    if (!vcs.count) return;
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (id vc in vcs) {
+        if (CYViewControllerIsAssistantTab(vc)) {
+            continue;
+        }
+        [filtered addObject:vc];
+    }
+    if (filtered.count != vcs.count) {
+        CYLog(@"[CYTabBarController] viewDidAppear cleanup: removed %lu assistant tab(s)",
+              (unsigned long)(vcs.count - filtered.count));
+        [self setViewControllers:filtered.copy animated:NO];
+    }
 }
 
 %end
