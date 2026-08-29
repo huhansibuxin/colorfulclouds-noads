@@ -230,16 +230,29 @@ static void CYDumpTabDiagnostics(NSArray *vcs, NSString *where) {
     }
 }
 
+// 取一个 tab VC 实际呈现在 tabBar 上的 item（兼容 UINavigationController 包装）
+static UITabBarItem *CYEffectiveTabBarItem(id vc) {
+    if (![vc respondsToSelector:@selector(tabBarItem)]) return nil;
+    UITabBarItem *item = [vc tabBarItem];
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        UIViewController *root = [(UINavigationController *)vc viewControllers].firstObject;
+        if (root && root.tabBarItem) {
+            item = root.tabBarItem;
+        }
+    }
+    return item;
+}
+
 static BOOL CYViewControllerIsAssistantTab(id vc) {
     if (!vc) return NO;
 
-    // 1) tabBarItem.title 明确写着「小助手」
-    NSString *title = nil;
-    if ([vc respondsToSelector:@selector(tabBarItem)]) {
-        title = [vc tabBarItem].title;
-    }
+    // 1) tabBarItem.title / 类名明确写着「小助手」
+    // 注意：title 通常设置在 UINavigationController 的 rootViewController 上，
+    // 直接读 [vc tabBarItem].title 会得到空字符串。
+    UITabBarItem *item = CYEffectiveTabBarItem(vc);
+    NSString *title = item.title ?: @"";
     if (!title.length && [vc respondsToSelector:@selector(title)]) {
-        title = [vc title];
+        title = [vc title] ?: @"";
     }
     if (title.length && ([title containsString:@"小助手"] || [title containsString:@"助手"])) {
         CYLog(@"[Tab] filter by title: %@", title);
@@ -253,15 +266,31 @@ static BOOL CYViewControllerIsAssistantTab(id vc) {
         return YES;
     }
 
-    // 3) ivar 指纹扫描（解开 nav 包装后判断，Swift 类名未知也能命中）
+    // 3) 已知白名单：天气/降水图/我的 都不删，避免误杀
+    static NSSet *whitelist = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        whitelist = [NSSet setWithObjects:
+            @"CYMainController",
+            @"CYMapController", @"CYGaodeMapController", @"CYIOSMapController",
+            @"CYConfigureViewController",
+            @"UINavigationController",
+            nil];
+    });
     UIViewController *root = CYUnwrapRootViewController(vc);
+    NSString *rootCls = root ? NSStringFromClass([root class]) : @"";
+    if ([whitelist containsObject:clsName] || [whitelist containsObject:rootCls]) {
+        return NO;
+    }
+
+    // 4) 兜底：ivar/method 聊天指纹（只删高度疑似且不在白名单里的）
     if (root && CYClassLooksLikeAssistant([root class])) {
-        CYLog(@"[Tab] filter by ivar fingerprint: %@ (wrapped: %@)",
-              NSStringFromClass([root class]), clsName);
+        CYLog(@"[Tab] filter by ivar/method fingerprint: %@ (wrapped: %@)",
+              rootCls, clsName);
         return YES;
     }
 
-    // 4) 响应 assistantAction（小助手入口常见命名）
+    // 5) 响应 assistantAction（小助手入口常见命名）
     if ([vc respondsToSelector:NSSelectorFromString(@"assistantAction")]) {
         CYLog(@"[Tab] filter by assistantAction selector: %@", clsName);
         return YES;
