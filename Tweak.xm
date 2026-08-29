@@ -36,6 +36,9 @@
 @interface CYToastView : UIView
 @end
 
+@interface CYMainController : UIViewController
+@end
+
 #pragma mark - 日志工具
 
 static NSURL *CYLogFileURL(void) {
@@ -313,6 +316,26 @@ static NSString *CYExtractTitleFromObject(id obj) {
     return nil;
 }
 
+// 递归 dump 视图层级，用于找出自定义 tabbar 里的小助手按钮
+static void CYDumpViewHierarchy(UIView *view, int depth, int maxDepth) {
+    if (!view || depth > maxDepth) return;
+    NSString *indent = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    NSString *cls = NSStringFromClass([view class]);
+    CGRect f = view.frame;
+    NSString *acc = view.accessibilityIdentifier ?: @"";
+    CYLog(@"[Tree]%@%@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d acc='%@'",
+          indent, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
+          view.hidden, acc);
+    // UIButton 额外打标题
+    if ([view isKindOfClass:[UIButton class]]) {
+        NSString *t = [(UIButton *)view currentTitle] ?: @"";
+        CYLog(@"[Tree]%@  -> button title='%@'", indent, t);
+    }
+    for (UIView *sub in view.subviews) {
+        CYDumpViewHierarchy(sub, depth + 1, maxDepth);
+    }
+}
+
 static BOOL CYObjectIsAdPopup(id obj) {
     if (!obj) return NO;
     NSString *combined = @"";
@@ -421,6 +444,38 @@ static BOOL CYObjectIsAdPopup(id obj) {
               (unsigned long)(vcs.count - filtered.count));
         [self setViewControllers:filtered.copy animated:NO];
     }
+}
+
+%end
+
+#pragma mark - CYMainController：dump 视图层级找自定义 tabbar
+
+%hook CYMainController
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig(animated);
+    // 只在每次进程内首次出现时 dump，避免刷屏
+    static BOOL dumped = NO;
+    if (dumped) return;
+    dumped = YES;
+
+    CYLog(@"[Tree] === CYMainController view hierarchy ===");
+    CYLog(@"[Tree] self=%@ view=%@", NSStringFromClass([self class]),
+          NSStringFromClass([self.view class]));
+
+    // 子/弹出控制器
+    NSArray *children = self.childViewControllers ?: @[];
+    CYLog(@"[Tree] childViewControllers=%lu", (unsigned long)children.count);
+    for (UIViewController *c in children) {
+        CYLog(@"[Tree]   child: %@", NSStringFromClass([c class]));
+    }
+    if (self.presentedViewController) {
+        CYLog(@"[Tree]   presented: %@", NSStringFromClass([self.presentedViewController class]));
+    }
+
+    // 整棵 view 树，深度限制 6
+    CYDumpViewHierarchy(self.view, 0, 6);
+    CYLog(@"[Tree] === end ===");
 }
 
 %end
