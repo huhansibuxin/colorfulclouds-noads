@@ -10,7 +10,14 @@
 #import <substrate.h>
 
 // 前向声明目标类，否则 Logos 只生成 @class，编译器拿不到继承来的属性/方法
+// CYTabBarController 自带底部自定义栏：bottomBarView 里有 chatButton（小助手）、
+// isShowChat 是它的显示开关、goChat 是跳转入口。属性一律走 KVC 访问，避免类型不匹配。
 @interface CYTabBarController : UITabBarController
+- (void)refreshShowChat;
+- (void)refreshBottomView;
+- (void)refreshMyButton;
+- (void)goChat;
+- (void)goWeather;
 @end
 
 @interface CYAlertView : UIView
@@ -468,37 +475,77 @@ static BOOL CYObjectIsAdPopup(id obj) {
     return NO;
 }
 
-#pragma mark - UITabBarController：过滤小助手 tab
+// 小助手的实现：CYTabBarController 自定义底部栏里的 chatButton（核心手段在下面）
+// 说明：早期版本这里按 ivar 指纹过滤 viewControllers，结果把「天气」和「我的」
+// 两个 tab 一起判成小助手删光，UITabBarController 0 个 VC → 启动闪退。
+// 已经确认小助手不是系统 tab，所以下面的 setter 只做观察，绝不动数组。
+
+// 诊断：把底部栏的结构打出来，判断隐藏小助手后是否需要重新排版
+static void CYDumpBottomBar(id tbc) {
+    @try {
+        id bar = [tbc valueForKey:@"bottomBarView"];
+        if (![bar isKindOfClass:[UIView class]]) {
+            CYLog(@"[Bar] bottomBarView nil or not a view (%@)", bar ? NSStringFromClass([bar class]) : @"nil");
+            return;
+        }
+        UIView *v = (UIView *)bar;
+        CYLog(@"[Bar] bottomBarView=%@ f=(%.0f,%.0f,%.0f,%.0f) subs=%lu",
+              NSStringFromClass([v class]), v.frame.origin.x, v.frame.origin.y,
+              v.frame.size.width, v.frame.size.height, (unsigned long)v.subviews.count);
+        for (UIView *s in v.subviews) {
+            NSString *extra = @"";
+            if ([s isKindOfClass:[UIButton class]]) extra = [(UIButton *)s currentTitle] ?: @"";
+            if ([s isKindOfClass:[UILabel class]]) extra = [(UILabel *)s text] ?: @"";
+            CYLog(@"[Bar]   sub %@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d tag=%ld '%@'",
+                  NSStringFromClass([s class]), s.frame.origin.x, s.frame.origin.y,
+                  s.frame.size.width, s.frame.size.height, s.hidden, (long)s.tag, extra);
+        }
+    } @catch (NSException *e) {
+        CYLog(@"[Bar] dump failed: %@", e.reason);
+    }
+}
+
+// 把底部栏里的小助手按钮（及其背景）隐藏掉。用 KVC 取属性，不依赖具体类型。
+static void CYHideChatButton(id tbc, NSString *when) {
+    if (!tbc) return;
+    @try {
+        id chatBtn = [tbc valueForKey:@"chatButton"];
+        id chatBg  = [tbc valueForKey:@"chatBtnBgView"];
+        BOOL changed = NO;
+        if ([chatBtn isKindOfClass:[UIView class]]) {
+            UIView *v = (UIView *)chatBtn;
+            if (!v.hidden) {
+                v.hidden = YES;
+                changed = YES;
+            }
+        }
+        if ([chatBg isKindOfClass:[UIView class]]) {
+            UIView *v = (UIView *)chatBg;
+            if (!v.hidden) {
+                v.hidden = YES;
+                changed = YES;
+            }
+        }
+        if (changed) {
+            CYLog(@"[CYTabBar] hid chatButton via %@ (btn=%@ bg=%@)", when,
+                  chatBtn ? NSStringFromClass([chatBtn class]) : @"nil",
+                  chatBg ? NSStringFromClass([chatBg class]) : @"nil");
+        }
+    } @catch (NSException *e) {
+        CYLog(@"[CYTabBar] KVC chatButton failed @%@: %@", when, e.reason);
+    }
+}
 
 %hook UITabBarController
 
 - (void)setViewControllers:(NSArray *)viewControllers animated:(BOOL)animated {
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in viewControllers) {
-        if (CYViewControllerIsAssistantTab(vc)) {
-            continue;
-        }
-        [filtered addObject:vc];
-    }
-    if (filtered.count != viewControllers.count) {
-        CYLog(@"[UITabBarController] removed %lu assistant tab(s)", (unsigned long)(viewControllers.count - filtered.count));
-    }
-    %orig(filtered.copy, animated);
+    CYLog(@"[UITabBarController] setViewControllers:animated: (%lu)", (unsigned long)viewControllers.count);
+    %orig(viewControllers, animated);
 }
 
-// 同上：无 animated 的 setter 也要 hook
 - (void)setViewControllers:(NSArray *)viewControllers {
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in viewControllers) {
-        if (CYViewControllerIsAssistantTab(vc)) {
-            continue;
-        }
-        [filtered addObject:vc];
-    }
-    if (filtered.count != viewControllers.count) {
-        CYLog(@"[UITabBarController] removed %lu assistant tab(s) [no-animated]", (unsigned long)(viewControllers.count - filtered.count));
-    }
-    %orig(filtered.copy);
+    CYLog(@"[UITabBarController] setViewControllers: (%lu)", (unsigned long)viewControllers.count);
+    %orig(viewControllers);
 }
 
 %end
@@ -507,57 +554,58 @@ static BOOL CYObjectIsAdPopup(id obj) {
 
 %hook CYTabBarController
 
-// 注意：setViewControllers: 与 setViewControllers:animated: 是**两个不同的 selector**，
-// UIKit 内部不保证前者转发后者，两个都必须 hook，否则会整个漏掉。
+// 小助手不是 tab，是 CYTabBarController 底部栏 bottomBarView 里的一个 chatButton。
+// 所以 viewControllers 一个都别动——只观察，不再过滤（早期版本误删导致 0 个 VC 直接闪退）。
 - (void)setViewControllers:(NSArray *)viewControllers animated:(BOOL)animated {
-    CYLog(@"[CYTabBarController] setViewControllers:animated: called (%lu)", (unsigned long)viewControllers.count);
-    CYDumpTabDiagnostics(viewControllers, @"setViewControllers:animated:");
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in viewControllers) {
-        if (CYViewControllerIsAssistantTab(vc)) {
-            continue;
-        }
-        [filtered addObject:vc];
-    }
-    if (filtered.count != viewControllers.count) {
-        CYLog(@"[CYTabBarController] removed %lu assistant tab(s)", (unsigned long)(viewControllers.count - filtered.count));
-    }
-    %orig(filtered.copy, animated);
+    CYLog(@"[CYTabBarController] setViewControllers:animated: (%lu)", (unsigned long)viewControllers.count);
+    %orig(viewControllers, animated);
 }
 
 - (void)setViewControllers:(NSArray *)viewControllers {
-    CYLog(@"[CYTabBarController] setViewControllers: (no animated) called (%lu)", (unsigned long)viewControllers.count);
-    CYDumpTabDiagnostics(viewControllers, @"setViewControllers:");
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in viewControllers) {
-        if (CYViewControllerIsAssistantTab(vc)) {
-            continue;
-        }
-        [filtered addObject:vc];
-    }
-    if (filtered.count != viewControllers.count) {
-        CYLog(@"[CYTabBarController] removed %lu assistant tab(s) [no-animated]", (unsigned long)(viewControllers.count - filtered.count));
-    }
-    %orig(filtered.copy);
+    CYLog(@"[CYTabBarController] setViewControllers: (%lu)", (unsigned long)viewControllers.count);
+    %orig(viewControllers);
 }
 
-// 兜底：如果 tab 不是走 setter 初始化的（例如直接赋值 ivar），在界面出现后再清一次
+// ① 配置层：永远否认需要显示小助手
+- (BOOL)isShowChat {
+    return NO;
+}
+
+- (void)setIsShowChat:(BOOL)show {
+    CYLog(@"[CYTabBar] setIsShowChat:%d -> force NO", show);
+    %orig(NO);
+}
+
+// ② UI 层：底部栏每次重建/刷新后，把小助手按钮按下去（KVC 拿属性，避免类型耦合）
+- (void)refreshShowChat {
+    %orig;
+    CYHideChatButton(self, @"refreshShowChat");
+}
+
+- (void)refreshBottomView {
+    %orig;
+    CYHideChatButton(self, @"refreshBottomView");
+}
+
+- (void)refreshMyButton {
+    %orig;
+    CYHideChatButton(self, @"refreshMyButton");
+}
+
+// ③ 防呆：任何跳小助手的入口（deeplink / 推送 / 活动）都掐掉
+- (void)goChat {
+    CYLog(@"[CYTabBar] goChat blocked");
+    return;
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     %orig(animated);
-    NSArray *vcs = self.viewControllers;
-    if (!vcs.count) return;
-    CYDumpTabDiagnostics(vcs, @"viewDidAppear");
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (id vc in vcs) {
-        if (CYViewControllerIsAssistantTab(vc)) {
-            continue;
-        }
-        [filtered addObject:vc];
-    }
-    if (filtered.count != vcs.count) {
-        CYLog(@"[CYTabBarController] viewDidAppear cleanup: removed %lu assistant tab(s)",
-              (unsigned long)(vcs.count - filtered.count));
-        [self setViewControllers:filtered.copy animated:NO];
+    CYHideChatButton(self, @"viewDidAppear");
+    CYLog(@"[CYTabBar] tabs=%lu", (unsigned long)self.viewControllers.count);
+    static BOOL dumped = NO;
+    if (!dumped) {
+        dumped = YES;
+        CYDumpBottomBar(self);
     }
 }
 
@@ -597,11 +645,6 @@ static BOOL CYObjectIsAdPopup(id obj) {
               sv.frame.size.width, sv.frame.size.height, (unsigned long)sv.subviews.count);
     }
     CYLog(@"[Tree] === end ===");
-
-    // 底部自定义 tabbar 在 window 层级，主界面出现时直接 dump
-    CYDumpTabBarArea();
-    // 反射出 CYMainController 的全部 ivar / method，定位构建 tabbar 的入口
-    CYDumpClassRuntimeInfo([self class]);
 }
 
 // 底部四个按钮的点击回调就走这里，先记录下每个按钮对应的 type 值
@@ -876,22 +919,15 @@ static void hook_CYSystem_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     }
 }
 
-// 小助手页面兜底：即使从别的入口进来了，也立刻退回天气页并隐藏自身
+// 小助手页面兜底：只记录，不做隐藏/切 tab。
+// 上一版在这里 hidden + 强制 selectedIndex=0，结果：
+//   ① 启动时 CYChatViewController 就被预加载 viewDidAppear，直接把首屏搞黑；
+//   ② 切 tab 又触发一次，和 App 自身切换逻辑打成 101<->100 死循环。
+// 真正的入口在 CYTabBarController 的 chatButton 上，那儿掐掉就够了。
 static void (*orig_CYChat_viewDidAppear)(id self, SEL _cmd, BOOL animated);
 static void hook_CYChat_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    CYLog(@"[CYChat] viewDidAppear -> block assistant page");
+    CYLog(@"[CYChat] viewDidAppear (log only)");
     orig_CYChat_viewDidAppear(self, _cmd, animated);
-    UIViewController *vc = (UIViewController *)self;
-    vc.view.hidden = YES;
-    UITabBarController *tbc = vc.tabBarController;
-    if (tbc && tbc.viewControllers.count > 1) {
-        NSUInteger idx = [tbc.viewControllers indexOfObject:tbc.selectedViewController];
-        CYLog(@"[CYChat] fallback switch from index %lu", (unsigned long)idx);
-        tbc.selectedIndex = 0;
-    } else {
-        [vc.navigationController popViewControllerAnimated:NO];
-        [vc dismissViewControllerAnimated:NO completion:nil];
-    }
 }
 
 // 探测环境里到底有哪些 tabbar / chat 相关类，确认 Swift 类名与继承链
