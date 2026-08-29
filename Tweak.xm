@@ -7,6 +7,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <substrate.h>
 
 // 前向声明目标类，否则 Logos 只生成 @class，编译器拿不到继承来的属性/方法
 @interface CYTabBarController : UITabBarController
@@ -794,8 +795,171 @@ static BOOL CYObjectIsAdPopup(id obj) {
 
 %end
 
+#pragma mark - Swift 类的运行时 hook（真正的 tabbar 与小助手页面）
+
+// 真正的底部 tabbar 是 Swift 类 ColorfulCloudsPro.CYSystemTabBarController，
+// 小助手页面是 ColorfulCloudsPro.CYChatViewController。
+// Swift 类名带模块点号，Logos 的 %hook 会生成 `@class ColorfulCloudsPro.Xxx;`
+// 这种非法声明，所以一律走 objc_getClass + MSHookMessageEx。
+
+static BOOL CYIsChatAssistantVC(id vc) {
+    if (!vc) return NO;
+    NSString *cls = NSStringFromClass([vc class]);
+    if (!cls.length) return NO;
+    // 包一层 UINavigationController 的情况
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        for (UIViewController *c in [(UINavigationController *)vc viewControllers]) {
+            if (CYIsChatAssistantVC(c)) return YES;
+        }
+    }
+    if ([cls hasSuffix:@"CYChatViewController"]) return YES;
+    if ([cls hasSuffix:@"CYChatManager"]) return YES;
+    return NO;
+}
+
+static NSArray *CYFilterAssistantTabs(NSArray *vcs, NSString *tag) {
+    if (!vcs.count) return vcs;
+    CYLog(@"[SwiftTab] %@ incoming=%lu", tag, (unsigned long)vcs.count);
+    for (id vc in vcs) {
+        NSString *cls = NSStringFromClass([vc class]);
+        NSString *title = @"";
+        if ([vc respondsToSelector:@selector(tabBarItem)]) {
+            title = [(UIViewController *)vc tabBarItem].title ?: @"";
+        }
+        CYLog(@"[SwiftTab]   %@ title='%@' match=%d", cls, title, CYIsChatAssistantVC(vc));
+    }
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (id vc in vcs) {
+        if (CYIsChatAssistantVC(vc)) {
+            CYLog(@"[SwiftTab] %@ REMOVE assistant tab: %@", tag, NSStringFromClass([vc class]));
+            continue;
+        }
+        [filtered addObject:vc];
+    }
+    return filtered.count ? filtered.copy : vcs;  // 全删光会让 tabbar 崩，保底不删
+}
+
+static void (*orig_CYSystem_setVCs_animated)(id self, SEL _cmd, NSArray *vcs, BOOL animated);
+static void hook_CYSystem_setVCs_animated(id self, SEL _cmd, NSArray *vcs, BOOL animated) {
+    NSArray *filtered = CYFilterAssistantTabs(vcs, @"setViewControllers:animated:");
+    orig_CYSystem_setVCs_animated(self, _cmd, filtered, animated);
+}
+
+static void (*orig_CYSystem_setVCs)(id self, SEL _cmd, NSArray *vcs);
+static void hook_CYSystem_setVCs(id self, SEL _cmd, NSArray *vcs) {
+    NSArray *filtered = CYFilterAssistantTabs(vcs, @"setViewControllers:");
+    orig_CYSystem_setVCs(self, _cmd, filtered);
+}
+
+// 兜底：tab 若不是走 setter 赋值的，界面出现后再清一次；顺带 dump 一次真实 tab 列表
+static void (*orig_CYSystem_viewDidAppear)(id self, SEL _cmd, BOOL animated);
+static void hook_CYSystem_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    orig_CYSystem_viewDidAppear(self, _cmd, animated);
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+    NSArray *vcs = [(UITabBarController *)self viewControllers];
+    CYLog(@"[SwiftTab] viewDidAppear tabs=%lu", (unsigned long)vcs.count);
+    for (id vc in vcs) {
+        CYLog(@"[SwiftTab]   live: %@ title='%@'", NSStringFromClass([vc class]),
+              [vc respondsToSelector:@selector(tabBarItem)] ? ([(UIViewController *)vc tabBarItem].title ?: @"") : @"");
+    }
+    NSMutableArray *filtered = [NSMutableArray array];
+    for (id vc in vcs) {
+        if (CYIsChatAssistantVC(vc)) continue;
+        [filtered addObject:vc];
+    }
+    if (filtered.count && filtered.count != vcs.count) {
+        CYLog(@"[SwiftTab] viewDidAppear cleanup: %lu -> %lu",
+              (unsigned long)vcs.count, (unsigned long)filtered.count);
+        [(UITabBarController *)self setViewControllers:filtered.copy animated:NO];
+    }
+}
+
+// 小助手页面兜底：即使从别的入口进来了，也立刻退回天气页并隐藏自身
+static void (*orig_CYChat_viewDidAppear)(id self, SEL _cmd, BOOL animated);
+static void hook_CYChat_viewDidAppear(id self, SEL _cmd, BOOL animated) {
+    CYLog(@"[CYChat] viewDidAppear -> block assistant page");
+    orig_CYChat_viewDidAppear(self, _cmd, animated);
+    UIViewController *vc = (UIViewController *)self;
+    vc.view.hidden = YES;
+    UITabBarController *tbc = vc.tabBarController;
+    if (tbc && tbc.viewControllers.count > 1) {
+        NSUInteger idx = [tbc.viewControllers indexOfObject:tbc.selectedViewController];
+        CYLog(@"[CYChat] fallback switch from index %lu", (unsigned long)idx);
+        tbc.selectedIndex = 0;
+    } else {
+        [vc.navigationController popViewControllerAnimated:NO];
+        [vc dismissViewControllerAnimated:NO completion:nil];
+    }
+}
+
+// 探测环境里到底有哪些 tabbar / chat 相关类，确认 Swift 类名与继承链
+static void CYProbeClasses(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned)n);
+    n = objc_getClassList(classes, n);
+    CYLog(@"[Probe] total classes=%d", n);
+    for (int i = 0; i < n; i++) {
+        NSString *name = NSStringFromClass(classes[i]);
+        NSString *lo = name.lowercaseString;
+        if ([lo containsString:@"tabbar"] ||
+            [lo hasPrefix:@"colorfulcloudspro.cychat"] ||
+            [lo containsString:@"assistant"] ||
+            [lo containsString:@"colorfulcloudspro.cymain"] ||
+            [lo containsString:@"colorfulcloudspro.cyconfigure"]) {
+            CYLog(@"[Probe] %@  super=%@", name, NSStringFromClass(class_getSuperclass(classes[i])));
+        }
+    }
+    free(classes);
+}
+
+// Swift 类运行时名通常带模块前缀，少数情况下只剩 mangled 名，两种都试一遍
+static Class CYFindClass(NSArray<NSString *> *candidates) {
+    for (NSString *n in candidates) {
+        Class c = objc_getClass(n.UTF8String);
+        if (c) {
+            CYLog(@"[SwiftHook] resolved %@ (super=%@)", n, NSStringFromClass(class_getSuperclass(c)));
+            return c;
+        }
+    }
+    return Nil;
+}
+
+static void CYInstallSwiftHooks(void) {
+    CYProbeClasses();
+
+    Class sysTab = CYFindClass(@[@"ColorfulCloudsPro.CYSystemTabBarController",
+                                 @"_TtC17ColorfulCloudsPro24CYSystemTabBarController",
+                                 @"CYSystemTabBarController"]);
+    if (sysTab) {
+        CYLog(@"[SwiftHook] found CYSystemTabBarController");
+        MSHookMessageEx(sysTab, @selector(setViewControllers:animated:),
+                        (IMP)&hook_CYSystem_setVCs_animated, (IMP *)&orig_CYSystem_setVCs_animated);
+        MSHookMessageEx(sysTab, @selector(setViewControllers:),
+                        (IMP)&hook_CYSystem_setVCs, (IMP *)&orig_CYSystem_setVCs);
+        MSHookMessageEx(sysTab, @selector(viewDidAppear:),
+                        (IMP)&hook_CYSystem_viewDidAppear, (IMP *)&orig_CYSystem_viewDidAppear);
+    } else {
+        CYLog(@"[SwiftHook] CYSystemTabBarController NOT FOUND");
+    }
+
+    Class chat = CYFindClass(@[@"ColorfulCloudsPro.CYChatViewController",
+                               @"_TtC17ColorfulCloudsPro20CYChatViewController",
+                               @"CYChatViewController"]);
+    if (chat) {
+        CYLog(@"[SwiftHook] found CYChatViewController");
+        MSHookMessageEx(chat, @selector(viewDidAppear:),
+                        (IMP)&hook_CYChat_viewDidAppear, (IMP *)&orig_CYChat_viewDidAppear);
+    } else {
+        CYLog(@"[SwiftHook] CYChatViewController NOT FOUND");
+    }
+}
+
 #pragma mark - _ctor
 
 %ctor {
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
+    CYInstallSwiftHooks();
 }
