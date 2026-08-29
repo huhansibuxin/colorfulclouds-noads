@@ -329,8 +329,9 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
     if (!win) return;
 
     NSString *cls = NSStringFromClass([self class]);
+    BOOL onWindow = (self.superview == win);
     // 兜底 A：直接挂 window 的"居中卡片"浮层一律当弹窗干掉（不挑业务，全拦）
-    if (self.superview == win && CYLooksLikePopupOverlay(self, win)) {
+    if (onWindow && CYLooksLikePopupOverlay(self, win)) {
         CYLog(@"[Overlay] popup-like %@ -> hidden", cls);
         self.hidden = YES;
     }
@@ -345,6 +346,22 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
                 container.frame.size.width >= win.bounds.size.width * 0.8) {
                 container.hidden = YES;
                 CYLog(@"[AdOverlay] hid container %@", NSStringFromClass([container class]));
+            }
+        }
+    }
+    // 漏网定位（零噪音）：非系统类、直接挂 window、宽度 ≥ 30% 屏幕的可疑浮层，
+    // 同类只记一次。平时几乎不写；真弹窗出现时（无论拦没拦住）都会留下类名和尺寸，
+    // 方便从日志反推是哪一层没兜住。
+    if (onWindow && ![cls hasPrefix:@"UI"] && ![cls hasPrefix:@"_UI"]) {
+        CGRect f = self.frame;
+        if (f.size.width >= win.bounds.size.width * 0.30) {
+            static NSMutableSet *seen = nil;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+            if (![seen containsObject:cls]) {
+                [seen addObject:cls];
+                CYLog(@"[Overlay] %@ f=(%.0f,%.0f,%.0f,%.0f)",
+                      cls, f.origin.x, f.origin.y, f.size.width, f.size.height);
             }
         }
     }
