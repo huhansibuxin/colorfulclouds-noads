@@ -336,23 +336,47 @@ static void CYDumpViewHierarchy(UIView *view, int depth, int maxDepth) {
     }
 }
 
-// 只打印位于屏幕底部区域的视图（tabbar 就在那儿），避免整棵树刷屏
+// 找出视图响应链上最近的 UIViewController 类名（Flex 里 Nearest VC 就是这么来的）
+static NSString *CYNearestViewControllerName(UIView *view) {
+    UIResponder *r = view;
+    int guard = 0;
+    while (r && guard < 20) {
+        if ([r isKindOfClass:[UIViewController class]]) break;
+        r = [r nextResponder];
+        guard++;
+    }
+    return r ? NSStringFromClass([r class]) : @"(none)";
+}
+
+// 只打印位于屏幕底部区域的视图（自定义 tabbar 就在那儿），避免整棵树刷屏
 static void CYDumpBottomViews(UIView *view, CGFloat bottomY, int depth) {
     if (!view || depth > 12) return;
     CGRect f = view.frame;
-    // 视图本身或其子视图区域落在底部 → 打印
+    // 视图本身或其底边落在底部区域 → 打印
     BOOL inBottom = (f.origin.y >= bottomY) || (f.origin.y + f.size.height >= bottomY);
     if (inBottom) {
         NSString *indent = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
         NSString *cls = NSStringFromClass([view class]);
-        CYLog(@"[Bottom]%@%@ frame=(%.0f,%.0f,%.0f,%.0f) hidden=%d tag=%ld acc='%@'",
+        CYLog(@"[Bottom]%@%@ f=(%.0f,%.0f,%.0f,%.0f) hid=%d a=%.2f tag=%ld acc='%@' vc=%@",
               indent, cls, f.origin.x, f.origin.y, f.size.width, f.size.height,
-              view.hidden, (long)view.tag, view.accessibilityIdentifier ?: @"");
+              view.hidden, view.alpha, (long)view.tag,
+              view.accessibilityIdentifier ?: @"", CYNearestViewControllerName(view));
         if ([view isKindOfClass:[UIButton class]]) {
-            CYLog(@"[Bottom]%@  -> title='%@'", indent, [(UIButton *)view currentTitle] ?: @"");
+            UIButton *b = (UIButton *)view;
+            CYLog(@"[Bottom]%@  -> btn title='%@' img=%@",
+                  indent, [b currentTitle] ?: @"", [b currentImage] ?: (id)@"nil");
         }
         if ([view isKindOfClass:[UILabel class]]) {
             CYLog(@"[Bottom]%@  -> label='%@'", indent, [(UILabel *)view text] ?: @"");
+        }
+        if ([view isKindOfClass:[UIImageView class]]) {
+            UIImageView *iv = (UIImageView *)view;
+            CYLog(@"[Bottom]%@  -> img %@ hl=%d",
+                  indent, iv.image ? NSStringFromCGSize(iv.image.size) : @"nil", iv.highlighted);
+        }
+        if ([view isKindOfClass:[UITabBar class]]) {
+            CYLog(@"[Bottom]%@  -> tabBar items=%lu",
+                  indent, (unsigned long)([(UITabBar *)view items] ?: @[]).count);
         }
     }
     for (UIView *sub in view.subviews) {
@@ -360,28 +384,70 @@ static void CYDumpBottomViews(UIView *view, CGFloat bottomY, int depth) {
     }
 }
 
-// 从 keyWindow 根视图开始，把底部 tabbar 整条路径挖出来
+// 遍历所有 window（自定义 tabbar 可能挂在独立 window 上），把底部区域挖出来
 static void CYDumpTabBarArea(void) {
-    UIWindow *win = nil;
+    NSMutableArray<UIWindow *> *wins = [NSMutableArray array];
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if (scene.activationState == UISceneActivationStateForegroundActive &&
-                [scene isKindOfClass:[UIWindowScene class]]) {
-                for (UIWindow *w in [(UIWindowScene *)scene windows]) {
-                    if (w.isKeyWindow) { win = w; break; }
-                }
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in [(UIWindowScene *)scene windows]) {
+                [wins addObject:w];
             }
         }
     }
-    if (!win) win = UIApplication.sharedApplication.keyWindow;
-    if (!win) { CYLog(@"[Bottom] no keyWindow"); return; }
+    if (!wins.count) {
+        UIWindow *kw = UIApplication.sharedApplication.keyWindow;
+        if (kw) [wins addObject:kw];
+    }
+    if (!wins.count) { CYLog(@"[Bottom] NO WINDOW FOUND"); return; }
 
-    CGFloat h = win.bounds.size.height;
-    CGFloat bottomY = h - 160.0;
-    CYLog(@"[Bottom] === keyWindow=%@ h=%.0f bottomY=%.0f ===",
-          NSStringFromClass([win class]), h, bottomY);
-    CYDumpBottomViews(win, bottomY, 0);
-    CYLog(@"[Bottom] === end ===");
+    CYLog(@"[Bottom] === windows=%lu ===", (unsigned long)wins.count);
+    for (UIWindow *win in wins) {
+        CGFloat h = win.bounds.size.height;
+        CGFloat bottomY = h - 170.0;
+        CYLog(@"[Bottom] --- win=%@ frame=(%.0f,%.0f,%.0f,%.0f) key=%d lvl=%.0f bottomY=%.0f ---",
+              NSStringFromClass([win class]), win.frame.origin.x, win.frame.origin.y,
+              win.frame.size.width, win.frame.size.height, win.isKeyWindow,
+              win.windowLevel, bottomY);
+        CYDumpBottomViews(win, bottomY, 0);
+        CYLog(@"[Bottom] --- end win=%@ ---", NSStringFromClass([win class]));
+    }
+    CYLog(@"[Bottom] === dump end ===");
+}
+
+// 运行时反射：把某个类的 ivar / method 全列出来（找自定义 tabbar 的实现入口）
+static void CYDumpClassRuntimeInfo(Class cls) {
+    if (!cls) return;
+    CYLog(@"[Reflect] ==== %@ ====", NSStringFromClass(cls));
+
+    // ivar：从本类一路往上挖 4 层
+    Class c = cls;
+    int level = 0;
+    while (c && level < 4) {
+        unsigned int n = 0;
+        Ivar *list = class_copyIvarList(c, &n);
+        if (n) {
+            CYLog(@"[Reflect] -- ivars of %@ (%u) --", NSStringFromClass(c), n);
+            for (unsigned int i = 0; i < n; i++) {
+                NSString *name = @(ivar_getName(list[i]) ?: "");
+                NSString *type = @(ivar_getTypeEncoding(list[i]) ?: "");
+                CYLog(@"[Reflect]    %@ : %@", name, type);
+            }
+        }
+        free(list);
+        c = class_getSuperclass(c);
+        level++;
+    }
+
+    // method：只看本类
+    unsigned int m = 0;
+    Method *ms = class_copyMethodList(cls, &m);
+    CYLog(@"[Reflect] -- methods of %@ (%u) --", NSStringFromClass(cls), m);
+    for (unsigned int i = 0; i < m; i++) {
+        CYLog(@"[Reflect]    %@", NSStringFromSelector(method_getName(ms[i])));
+    }
+    free(ms);
+    CYLog(@"[Reflect] ==== end %@ ====", NSStringFromClass(cls));
 }
 
 static BOOL CYObjectIsAdPopup(id obj) {
@@ -524,7 +590,23 @@ static BOOL CYObjectIsAdPopup(id obj) {
     // 只记结构，不再整树 dump（太冗长且 tabbar 不在这一层）
     CYLog(@"[Tree] view=%@ subviews=%lu",
           NSStringFromClass([self.view class]), (unsigned long)self.view.subviews.count);
+    for (UIView *sv in self.view.subviews) {
+        CYLog(@"[Tree]   sub[%@] f=(%.0f,%.0f,%.0f,%.0f) subs=%lu",
+              NSStringFromClass([sv class]), sv.frame.origin.x, sv.frame.origin.y,
+              sv.frame.size.width, sv.frame.size.height, (unsigned long)sv.subviews.count);
+    }
     CYLog(@"[Tree] === end ===");
+
+    // 底部自定义 tabbar 在 window 层级，主界面出现时直接 dump
+    CYDumpTabBarArea();
+    // 反射出 CYMainController 的全部 ivar / method，定位构建 tabbar 的入口
+    CYDumpClassRuntimeInfo([self class]);
+}
+
+// 底部四个按钮的点击回调就走这里，先记录下每个按钮对应的 type 值
+- (void)tabbarSelectType:(long long)type isClickTabbar:(BOOL)clicked {
+    CYLog(@"[Tabbar] tabbarSelectType:%lld isClickTabbar:%d", type, clicked);
+    %orig(type, clicked);
 }
 
 %end
