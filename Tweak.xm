@@ -470,11 +470,64 @@ static void CYLogVipCreatorStack(NSString *stage) {
     CYLog(@"%@", log);
 }
 
+// 运行时反查"创建 CYVipBottomView 的那个方法"：遍历所有 ObjC 类的 method list，
+// 找到 IMP <= targetAddr 且最大的那个方法（即包含该调用点的函数），拿到 class+sel。
+// 若 sel 明显是 VIP/付费/会员相关，直接把它按死(no-op)，从根源掐断重建循环；
+// 若是通用布局方法(如 layoutSubviews)则只记录、不自动按死，避免误伤其它 UI。
+static BOOL gVipCreatorResolved = NO;
+static void CYResolveAndKillVipCreator(uintptr_t targetAddr) {
+    if (gVipCreatorResolved) return;
+    gVipCreatorResolved = YES;
+    unsigned int ccount = 0;
+    Class *classes = objc_copyClassList(&ccount);
+    Class bestCls = nil; SEL bestSel = NULL; uintptr_t bestImp = 0;
+    for (unsigned i = 0; i < ccount; i++) {
+        Class c = classes[i];
+        unsigned int mcount = 0;
+        Method *ms = class_copyMethodList(c, &mcount);
+        if (!ms) continue;
+        for (unsigned j = 0; j < mcount; j++) {
+            IMP imp = method_getImplementation(ms[j]);
+            uintptr_t p = (uintptr_t)imp;
+            if (p <= targetAddr && p > bestImp) {
+                bestImp = p; bestCls = c; bestSel = method_getName(ms[j]);
+            }
+        }
+        free(ms);
+    }
+    free(classes);
+    if (!bestCls) {
+        CYLog(@"[VipKill] 未找到包含创建点的 ObjC 方法 (0x%lx) -> 纯 Swift，回退到浮层 hide", (unsigned long)targetAddr);
+        return;
+    }
+    NSString *selName = NSStringFromSelector(bestSel);
+    NSString *clsName = NSStringFromClass(bestCls);
+    CYLog(@"[VipKill] 创建方法: -[%@ %@]  imp=0x%lx  target=0x%lx",
+          clsName, selName, (unsigned long)bestImp, (unsigned long)targetAddr);
+    NSString *lo = [selName lowercaseString];
+    BOOL looksVip = [lo containsString:@"vip"] || [lo containsString:@"svip"] ||
+                    [lo containsString:@"pay"] || [lo containsString:@"member"] ||
+                    [lo containsString:@"付费"] || [lo containsString:@"会员"];
+    if (looksVip) {
+        CYLog(@"[VipKill] 判定为 SVIP/付费/会员 创建方法 -> 按死(no-op)");
+        MSHookMessageEx(bestCls, bestSel, (IMP)^void(id s, SEL _c){
+            CYLog(@"[VipKill] blocked -[%@ %@]", NSStringFromClass(bestCls), NSStringFromSelector(bestSel));
+        }, NULL);
+    } else {
+        CYLog(@"[VipKill] sel 非 VIP 专属(可能是通用布局方法) -> 暂不自动按死，仅记录，待人工确认");
+    }
+}
+
 static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
 static id (*origCYVipInit)(id, SEL);
 static id (*origCYVipInitWithCoder)(id, SEL, NSCoder *);
 
 static id CYVipInitWithFrame(id self, SEL _cmd, CGRect frame) {
+    NSArray *ra = [NSThread callStackReturnAddresses];
+    if (ra.count > 2) {
+        // ra[2] = 创建 CYVipBottomView 的那个方法里的返回地址
+        CYResolveAndKillVipCreator((uintptr_t)[ra[2] unsignedLongLongValue]);
+    }
     CYLogVipCreatorStack(@"initWithFrame:");
     return origCYVipInitWithFrame(self, _cmd, frame);
 }
