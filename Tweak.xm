@@ -462,9 +462,24 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 // CYConfigureHeadView 本身，因此会员配置页不会因 IBOutlet 强解包而崩溃。
 static BOOL gVipCreatorHooked = NO;
 
-// 通用 no-op：返回 0（指针→nil / bool→NO / Int→0），适配任意 Swift 创建方法签名
-static uintptr_t CYVipCreatorNoop(void) {
-    return 0;
+// 安全"按死"：替换创建方法，不执行真实 SVIP 广告构建逻辑，而是返回一个非 nil 的
+// 空白 CYVipBottomView 实例（立即隐藏+禁交互）。这样：
+//  1) 真实的 SVIP 广告视图/数据拉取逻辑不再执行（从源头掐断猫鼠重建，CPU 不再空转）；
+//  2) 调用方拿到非 nil 实例，Swift 非可选强解包不会崩溃（设置页等路径不再崩）。
+// 注意：创建方法是共享的（设置页会员配置头也走它），返回 nil 会让强解包路径崩溃，
+// 故必须用"空白实例"而非 nil。alloc+initWithFrame: 走的是已被 hook 的 initWithFrame:，
+// 且 gVipCreatorHooked 已置位不会重入本替换，无递归风险。
+static id CYVipCreatorSafe(id self, SEL _cmd) {
+    Class cls = objc_getClass("ColorfulCloudsPro.CYVipBottomView");
+    id v = cls ? [[cls alloc] initWithFrame:CGRectZero] : nil;
+    if (v) {
+        [v setHidden:YES];
+        [v setUserInteractionEnabled:NO];
+        CYLog(@"[VipKill] 已用空白实例替换真实 SVIP 创建（非 nil，防强解包崩溃）");
+    } else {
+        CYLog(@"[VipKill] 空白实例创建失败 -> 回退浮层 hide");
+    }
+    return v;
 }
 
 // 从调用点返回地址（位于创建方法体内）向后扫描解密后的 __TEXT，定位函数入口序言。
@@ -498,8 +513,8 @@ static void CYTryHookVipCreator(uintptr_t retAddr) {
     if (dladdr((void *)entry, &info)) { fname = info.dli_fname ? info.dli_fname : "?"; base = (uintptr_t)info.dli_fbase; }
     CYLog(@"[VipKill] 创建方法入口=0x%lx (off=0x%lx) img=%s",
           (unsigned long)entry, (unsigned long)(entry - base), fname);
-    MSHookFunction((void *)entry, (void *)CYVipCreatorNoop, NULL);
-    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> CYVipBottomView 不再被创建");
+    MSHookFunction((void *)entry, (void *)CYVipCreatorSafe, NULL);
+    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> 返回空白实例，真实广告视图不再构建");
 }
 
 static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
