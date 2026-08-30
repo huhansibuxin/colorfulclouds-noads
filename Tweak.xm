@@ -484,13 +484,15 @@ static void CYInstallVipSafe(void) {
     MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoderSafe, (IMP *)&origCYVipInitWithCoder);
 }
 
-// 零闪烁打磨（主拦截）：CYConfigureHeadView（会员配置头，CYVipBottomView 的父视图）在每次 layout
-// 时把 CYVipBottomView 重新加为子视图 -> 猫鼠循环。hook 它的 @objc didAddSubview:，子视图一被加入
-// 就立刻 removeFromSuperview+隐藏+禁交互，视图从未进入 window 渲染，故零闪烁；同时也让下方
-// didMoveToWindow 不再需要反复 hide。CYConfigureHeadView 是 UIKit 子类，didAddSubview: 为 @objc，
-// ABI 与 (id,SEL,UIView*) 一致，MSHookMessageEx swizzle 完全安全（不会像私有 Swift 创建函数那样崩）。
-// 这是"主拦截"，下方 CYVipBottomView 的 @objc init 中和作为兜底。
-static void (*origConfigureDidAddSubview)(id, SEL, UIView *) = NULL;
+// 零闪烁打磨（主拦截）：无论哪个父视图把会员/付费类子视图加进来，都立刻 removeFromSuperview，
+// 视图从未进入 window 渲染 -> 零闪烁；同时也让下方 didMoveToWindow 不再需要反复 hide。
+// 实测只 hook CYConfigureHeadView didAddSubview: 命中 0 次 —— 因为 CYVipBottomView 实际被加在
+// CYConfigureHeadView 的*子视图*（如 contentView）上，而非直接加在 CYConfigureHeadView 本身，
+// 故父视图的 didAddSubview: 收不到它。改为 hook UIView 全局 didAddSubview: 才能稳定兜住。
+// UIView 是 ObjC，didAddSubview: 为 @objc，ABI 与 (id,SEL,UIView*) 一致，MSHookMessageEx swizzle
+// 完全安全（不会像私有 Swift 创建函数那样崩）。这是"主拦截"，下方 CYVipBottomView 的 @objc init
+// 中和作为兜底。
+static void (*origUIViewDidAddSubview)(id, SEL, UIView *) = NULL;
 
 static BOOL CYIsMemberPayBottomView(UIView *v) {
     if (!v) return NO;
@@ -507,8 +509,8 @@ static BOOL CYIsMemberPayBottomView(UIView *v) {
     return NO;
 }
 
-static void CYConfigureHeadDidAddSubview(id self, SEL _cmd, UIView *subview) {
-    if (origConfigureDidAddSubview) origConfigureDidAddSubview(self, _cmd, subview);
+static void CYUIViewDidAddSubview(id self, SEL _cmd, UIView *subview) {
+    if (origUIViewDidAddSubview) origUIViewDidAddSubview(self, _cmd, subview);
     if (CYIsMemberPayBottomView(subview)) {
         [subview removeFromSuperview];
         [subview setHidden:YES];
@@ -517,18 +519,13 @@ static void CYConfigureHeadDidAddSubview(id self, SEL _cmd, UIView *subview) {
     }
 }
 
-static void CYInstallConfigureHeadGuard(void) {
-    Class cls = objc_getClass("ColorfulCloudsPro.CYConfigureHeadView");
-    if (!cls) {
-        CYLog(@"[VipSafe] CYConfigureHeadView not found（didAddSubview 主拦截跳过，依赖 init 中和兜底）");
-        return;
-    }
-    CYLog(@"[VipSafe] 已安装 CYConfigureHeadView didAddSubview: 主拦截（零闪烁）");
-    MSHookMessageEx(cls, @selector(didAddSubview:), (IMP)CYConfigureHeadDidAddSubview, (IMP *)&origConfigureDidAddSubview);
+static void CYInstallDidAddSubviewGuard(void) {
+    CYLog(@"[VipSafe] 已安装 UIView didAddSubview: 主拦截（零闪烁，全局）");
+    MSHookMessageEx([UIView class], @selector(didAddSubview:), (IMP)CYUIViewDidAddSubview, (IMP *)&origUIViewDidAddSubview);
 }
 
 %ctor {
-    CYInstallConfigureHeadGuard();   // 零闪烁主拦截：父视图一加子视图就移除
+    CYInstallDidAddSubviewGuard();   // 零闪烁主拦截：任意父视图一加会员/付费子视图就移除
     CYInstallVipSafe();              // 兜底：CYVipBottomView 出生即隐藏（@objc init 中和）
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
