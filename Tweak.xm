@@ -449,6 +449,57 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 
 %end
 
+#pragma mark - 临时诊断：抓 CYVipBottomView 创建栈（定位源头后删除）
+
+// TEMP DIAGNOSTIC：抓出是谁在创建 CYVipBottomView（SVIP 底部浮层）。
+// 通过 init 时机记录调用栈，从日志反推创建者方法，之后把那个创建方法按死即可
+// 结束"猫鼠"重建循环。诊断结束（已拿到调用栈并 kill 源头）后整段删除。
+static void CYLogVipCreatorStack(NSString *stage) {
+    NSArray<NSString *> *syms = [NSThread callStackSymbols];
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    // 用整条栈做签名去重，同一个调用点只记一次，避免刷屏
+    NSString *key = [syms componentsJoinedByString:@"\n"];
+    if ([seen containsObject:key]) return;
+    [seen addObject:key];
+    NSMutableString *log = [NSMutableString stringWithFormat:@"[VipCreator:%@] %lu frames:\n", stage, (unsigned long)syms.count];
+    for (NSString *s in syms) {
+        [log appendFormat:@"  %@\n", s];
+    }
+    CYLog(@"%@", log);
+}
+
+static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
+static id (*origCYVipInit)(id, SEL);
+static id (*origCYVipInitWithCoder)(id, SEL, NSCoder *);
+
+static id CYVipInitWithFrame(id self, SEL _cmd, CGRect frame) {
+    CYLogVipCreatorStack(@"initWithFrame:");
+    return origCYVipInitWithFrame(self, _cmd, frame);
+}
+static id CYVipInit(id self, SEL _cmd) {
+    CYLogVipCreatorStack(@"init");
+    return origCYVipInit(self, _cmd);
+}
+static id CYVipInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
+    CYLogVipCreatorStack(@"initWithCoder:");
+    return origCYVipInitWithCoder(self, _cmd, coder);
+}
+
+static void CYInstallVipCreatorProbe(void) {
+    Class cls = objc_getClass("ColorfulCloudsPro.CYVipBottomView");
+    if (!cls) {
+        CYLog(@"[VipCreator] class ColorfulCloudsPro.CYVipBottomView not found");
+        return;
+    }
+    CYLog(@"[VipCreator] hooked %@", NSStringFromClass(cls));
+    MSHookMessageEx(cls, @selector(initWithFrame:), (IMP)CYVipInitWithFrame, (IMP *)&origCYVipInitWithFrame);
+    MSHookMessageEx(cls, @selector(init), (IMP)CYVipInit, (IMP *)&origCYVipInit);
+    MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoder, (IMP *)&origCYVipInitWithCoder);
+}
+
 %ctor {
+    CYInstallVipCreatorProbe();
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
