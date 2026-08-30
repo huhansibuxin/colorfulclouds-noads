@@ -14,6 +14,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <substrate.h>
+#import <dlfcn.h>
 
 // Logos 只生成 @class 前向声明，访问继承来的成员或自己的方法必须先声明。
 // 属性一律走 KVC（valueForKey:）访问，避免和真实类型耦合。
@@ -452,74 +454,47 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 #pragma mark - 临时诊断：抓 CYVipBottomView 创建栈（定位源头后删除）
 
 // TEMP DIAGNOSTIC：抓出是谁在创建 CYVipBottomView（SVIP 底部浮层）。
-// 通过 init 时机记录调用栈，从日志反推创建者方法，之后把那个创建方法按死即可
-// 结束"猫鼠"重建循环。诊断结束（已拿到调用栈并 kill 源头）后整段删除。
-static void CYLogVipCreatorStack(NSString *stage) {
-    NSArray<NSString *> *syms = [NSThread callStackSymbols];
-    static NSMutableSet *seen = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-    // 用整条栈做签名去重，同一个调用点只记一次，避免刷屏
-    NSString *key = [syms componentsJoinedByString:@"\n"];
-    if ([seen containsObject:key]) return;
-    [seen addObject:key];
-    NSMutableString *log = [NSMutableString stringWithFormat:@"[VipCreator:%@] %lu frames:\n", stage, (unsigned long)syms.count];
-    for (NSString *s in syms) {
-        [log appendFormat:@"  %@\n", s];
-    }
-    CYLog(@"%@", log);
+// 根源治理：CYVipBottomView 由 CYConfigureHeadView（会员配置头）在每次 layout 时
+// 重新从 nib 解码并创建（猫鼠循环）。创建它的那个方法是纯 Swift 方法（不在 ObjC
+// runtime 方法表里），无法按名字 hook。改为：在 CYVipBottomView 的 init 时机拿到
+// 调用者返回地址 ra[1]（位于创建方法体内），向后扫描解密后的 __TEXT 找函数序言入口，
+// 再用 MSHookFunction 把它按死(no-op)。只杀"创建 VIP 底部浮层"这一处，不碰
+// CYConfigureHeadView 本身，因此会员配置页不会因 IBOutlet 强解包而崩溃。
+static BOOL gVipCreatorHooked = NO;
+
+// 通用 no-op：返回 0（指针→nil / bool→NO / Int→0），适配任意 Swift 创建方法签名
+static uintptr_t CYVipCreatorNoop(void) {
+    return 0;
 }
 
-// 运行时反查"创建 CYVipBottomView 的那个方法"：遍历所有 ObjC 类的 method list，
-// 找到 IMP <= targetAddr 且最大的那个方法（即包含该调用点的函数），拿到 class+sel。
-// 若 sel 明显是 VIP/付费/会员相关，直接把它按死(no-op)，从根源掐断重建循环；
-// 若是通用布局方法(如 layoutSubviews)则只记录、不自动按死，避免误伤其它 UI。
-static BOOL gVipCreatorResolved = NO;
-
-// 被按死的创建方法的替换实现：整体不执行（它只负责创建/展示 SVIP 底部浮层）
-static void CYVipCreatorKilled(id s, SEL _c) {
-    CYLog(@"[VipKill] blocked -[%@ %@]", NSStringFromClass([s class]), NSStringFromSelector(_c));
+// 从调用点返回地址（位于创建方法体内）向后扫描解密后的 __TEXT，
+// 定位函数入口序言：stp x29,x30,[sp,#-imm]!  => 小端字节 FD FE ?? A9
+static uintptr_t CYFindFunctionEntry(uintptr_t retAddr) {
+    uintptr_t start = retAddr & ~(uintptr_t)0x3;
+    for (uintptr_t p = start; p > start - 16384; p -= 4) {
+        uint32_t insn = *(volatile uint32_t *)p;
+        uint8_t b0 = (uint8_t)(insn & 0xFF);
+        uint8_t b1 = (uint8_t)((insn >> 8) & 0xFF);
+        uint8_t b3 = (uint8_t)((insn >> 24) & 0xFF);
+        if (b0 == 0xFD && b1 == 0xFE && b3 == 0xA9) return p; // 命中序言 = 函数入口
+    }
+    return 0;
 }
 
-static void CYResolveAndKillVipCreator(uintptr_t targetAddr) {
-    if (gVipCreatorResolved) return;
-    gVipCreatorResolved = YES;
-    unsigned int ccount = 0;
-    Class *classes = objc_copyClassList(&ccount);
-    Class bestCls = nil; SEL bestSel = NULL; uintptr_t bestImp = 0;
-    for (unsigned i = 0; i < ccount; i++) {
-        Class c = classes[i];
-        unsigned int mcount = 0;
-        Method *ms = class_copyMethodList(c, &mcount);
-        if (!ms) continue;
-        for (unsigned j = 0; j < mcount; j++) {
-            IMP imp = method_getImplementation(ms[j]);
-            uintptr_t p = (uintptr_t)imp;
-            if (p <= targetAddr && p > bestImp) {
-                bestImp = p; bestCls = c; bestSel = method_getName(ms[j]);
-            }
-        }
-        free(ms);
-    }
-    free(classes);
-    if (!bestCls) {
-        CYLog(@"[VipKill] 未找到包含创建点的 ObjC 方法 (0x%lx) -> 纯 Swift，回退到浮层 hide", (unsigned long)targetAddr);
+static void CYTryHookVipCreator(uintptr_t retAddr) {
+    if (gVipCreatorHooked) return;
+    gVipCreatorHooked = YES;
+    uintptr_t entry = CYFindFunctionEntry(retAddr);
+    if (!entry) {
+        CYLog(@"[VipKill] 未定位到创建方法入口(序言扫描失败) -> 回退浮层 hide");
         return;
     }
-    NSString *selName = NSStringFromSelector(bestSel);
-    NSString *clsName = NSStringFromClass(bestCls);
-    CYLog(@"[VipKill] 创建方法: -[%@ %@]  imp=0x%lx  target=0x%lx",
-          clsName, selName, (unsigned long)bestImp, (unsigned long)targetAddr);
-    NSString *lo = [selName lowercaseString];
-    BOOL looksVip = [lo containsString:@"vip"] || [lo containsString:@"svip"] ||
-                    [lo containsString:@"pay"] || [lo containsString:@"member"] ||
-                    [lo containsString:@"付费"] || [lo containsString:@"会员"];
-    if (looksVip) {
-        CYLog(@"[VipKill] 判定为 SVIP/付费/会员 创建方法 -> 按死(no-op)");
-        MSHookMessageEx(bestCls, bestSel, (IMP)CYVipCreatorKilled, NULL);
-    } else {
-        CYLog(@"[VipKill] sel 非 VIP 专属(可能是通用布局方法) -> 暂不自动按死，仅记录，待人工确认");
-    }
+    Dl_info info; const char *fname = "?"; uintptr_t base = 0;
+    if (dladdr((void *)entry, &info)) { fname = info.dli_fname ? info.dli_fname : "?"; base = (uintptr_t)info.dli_fbase; }
+    CYLog(@"[VipKill] 创建方法入口=0x%lx (off=0x%lx) img=%s",
+          (unsigned long)entry, (unsigned long)(entry - base), fname);
+    MSHookFunction((void *)entry, (void *)CYVipCreatorNoop, NULL);
+    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> CYVipBottomView 不再被创建");
 }
 
 static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
@@ -528,19 +503,17 @@ static id (*origCYVipInitWithCoder)(id, SEL, NSCoder *);
 
 static id CYVipInitWithFrame(id self, SEL _cmd, CGRect frame) {
     NSArray *ra = [NSThread callStackReturnAddresses];
-    if (ra.count > 2) {
-        // ra[2] = 创建 CYVipBottomView 的那个方法里的返回地址
-        CYResolveAndKillVipCreator((uintptr_t)[ra[2] unsignedLongLongValue]);
-    }
-    CYLogVipCreatorStack(@"initWithFrame:");
+    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
     return origCYVipInitWithFrame(self, _cmd, frame);
 }
 static id CYVipInit(id self, SEL _cmd) {
-    CYLogVipCreatorStack(@"init");
+    NSArray *ra = [NSThread callStackReturnAddresses];
+    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
     return origCYVipInit(self, _cmd);
 }
 static id CYVipInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
-    CYLogVipCreatorStack(@"initWithCoder:");
+    NSArray *ra = [NSThread callStackReturnAddresses];
+    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
     return origCYVipInitWithCoder(self, _cmd, coder);
 }
 
@@ -550,7 +523,7 @@ static void CYInstallVipCreatorProbe(void) {
         CYLog(@"[VipCreator] class ColorfulCloudsPro.CYVipBottomView not found");
         return;
     }
-    CYLog(@"[VipCreator] hooked %@", NSStringFromClass(cls));
+    CYLog(@"[VipCreator] hooked %@ (准备按死创建它的 Swift 方法)", NSStringFromClass(cls));
     MSHookMessageEx(cls, @selector(initWithFrame:), (IMP)CYVipInitWithFrame, (IMP *)&origCYVipInitWithFrame);
     MSHookMessageEx(cls, @selector(init), (IMP)CYVipInit, (IMP *)&origCYVipInit);
     MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoder, (IMP *)&origCYVipInitWithCoder);
