@@ -453,106 +453,38 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 
 #pragma mark - 临时诊断：抓 CYVipBottomView 创建栈（定位源头后删除）
 
-// TEMP DIAGNOSTIC：抓出是谁在创建 CYVipBottomView（SVIP 底部浮层）。
-// 根源治理：CYVipBottomView 由 CYConfigureHeadView（会员配置头）在每次 layout 时
-// 重新从 nib 解码并创建（猫鼠循环）。创建它的那个方法是纯 Swift 方法（不在 ObjC
-// runtime 方法表里），无法按名字 hook。改为：在 CYVipBottomView 的 init 时机拿到
-// 调用者返回地址 ra[1]（位于创建方法体内），向后扫描解密后的 __TEXT 找函数序言入口，
-// 再用 MSHookFunction 把它按死(no-op)。只杀"创建 VIP 底部浮层"这一处，不碰
-// CYConfigureHeadView 本身，因此会员配置页不会因 IBOutlet 强解包而崩溃。
-static BOOL gVipCreatorHooked = NO;
-// 原始创建函数指针（MSHookFunction 回传），用于"调用原函数 + 当场中和"的安全按死
-static id (*gOrigVipCreator)(id, SEL) = NULL;
+// 安全"按死"源头（ABI 安全版）：在 CYVipBottomView 的 @objc 初始化方法里，调用原始 init
+// 拿到真实实例，立即隐藏+禁交互。CYVipBottomView 是 UIView 子类，initWithFrame:/initWithCoder:
+// 均为 @objc，ABI 与 (id,SEL,...) 一致，用 MSHookMessageEx swizzle 完全安全——不会出现之前
+// MSHookFunction 改"私有 Swift 创建函数"（无 _cmd、返回可能是 Optional 结构体）导致的 ABI 错乱
+// 与设置页强解包崩溃。浮层在"出生"时即被中和，App 即便反复从 nib 重建，每次都被立刻隐藏，
+// 无闪烁、无崩溃；下方 didMoveToWindow 仍兜底（最后一道拦截）。
+static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
+static id (*origCYVipInitWithCoder)(id, SEL, NSCoder *);
 
-// 安全"按死"：调用原始创建函数拿到**真实（含子视图、用正确 frame）**的 CYVipBottomView
-// 实例，再当场 removeFromSuperview + 隐藏 + 禁交互 + 归零 frame，返回该真实实例。这样：
-//  1) 不踩零 frame 崩溃（原始函数用正确 frame 构建，内部布局/子视图齐全）；
-//  2) 返回非 nil 真实实例，调用方 Swift 强解包（含其子视图）不会崩溃 -> 设置页不再崩；
-//  3) 浮层被中和（不可见、不接收事件），从源头拦截弹窗，同时 didMoveToWindow 仍兜底。
-// 注：创建方法是共享函数（设置页会员配置头也走它），只能"建真实例再隐藏"，不能返回 nil
-// 或空白实例。gVipCreatorHooked 已置位，原函数内部的 initWithFrame: 不会再触发本替换。
-static id CYVipCreatorSafe(id self, SEL _cmd) {
-    id v = gOrigVipCreator ? gOrigVipCreator(self, _cmd) : nil;
-    if (v && [v isKindOfClass:[UIView class]]) {
-        [v removeFromSuperview];
-        [v setHidden:YES];
-        [v setUserInteractionEnabled:NO];
-        [v setFrame:CGRectZero];
-        CYLog(@"[VipKill] 已调用原函数并中和真实 SVIP 实例（非 nil，防强解包崩溃）");
-    } else {
-        CYLog(@"[VipKill] 原函数返回 nil -> 回退浮层 hide");
-    }
+static id CYVipInitWithFrameSafe(id self, SEL _cmd, CGRect frame) {
+    id v = origCYVipInitWithFrame(self, _cmd, frame);
+    if (v) { [v setHidden:YES]; [v setUserInteractionEnabled:NO]; }
+    return v;
+}
+static id CYVipInitWithCoderSafe(id self, SEL _cmd, NSCoder *coder) {
+    id v = origCYVipInitWithCoder(self, _cmd, coder);
+    if (v) { [v setHidden:YES]; [v setUserInteractionEnabled:NO]; }
     return v;
 }
 
-// 从调用点返回地址（位于创建方法体内）向后扫描解密后的 __TEXT，定位函数入口序言。
-// 标准函数序言 stp x29,x30,[sp,#-imm]! 的小端机器码 = [0xFD, <imm 变>, 0xBF, 0xA9]
-//   byte0=0xFD (Rt=x29)  byte2=0xBF (Rt2=x30)  byte3=0xA9 (store-pair pre-index)
-//   byte1 随栈帧偏移变化，不能作为匹配项。故只卡 byte0/byte2/byte3 三个固定字节。
-static uintptr_t CYFindFunctionEntry(uintptr_t retAddr) {
-    uintptr_t start = retAddr & ~(uintptr_t)0x3;
-    for (uintptr_t p = start; p > start - 16384; p -= 4) {
-        uint32_t insn = *(volatile uint32_t *)p;
-        uint8_t b0 = (uint8_t)(insn & 0xFF);
-        uint8_t b2 = (uint8_t)((insn >> 16) & 0xFF);
-        uint8_t b3 = (uint8_t)((insn >> 24) & 0xFF);
-        // 主匹配：stp x29,x30,[sp,#-imm]!（函数入口最通用的序言）
-        if (b0 == 0xFD && b2 == 0xBF && b3 == 0xA9) return p;
-        // 兜底：stp x20,x19,[sp,#-imm]!（部分 Swift 方法先压其它寄存器）
-        if (b0 == 0xA0 && b2 == 0xA7 && b3 == 0xA9) return p;
-    }
-    return 0;
-}
-
-static void CYTryHookVipCreator(uintptr_t retAddr) {
-    if (gVipCreatorHooked) return;
-    gVipCreatorHooked = YES;
-    uintptr_t entry = CYFindFunctionEntry(retAddr);
-    if (!entry) {
-        CYLog(@"[VipKill] 未定位到创建方法入口(序言扫描失败) -> 回退浮层 hide");
-        return;
-    }
-    Dl_info info; const char *fname = "?"; uintptr_t base = 0;
-    if (dladdr((void *)entry, &info)) { fname = info.dli_fname ? info.dli_fname : "?"; base = (uintptr_t)info.dli_fbase; }
-    CYLog(@"[VipKill] 创建方法入口=0x%lx (off=0x%lx) img=%s",
-          (unsigned long)entry, (unsigned long)(entry - base), fname);
-    MSHookFunction((void *)entry, (void *)CYVipCreatorSafe, (void **)&gOrigVipCreator);
-    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> 调用原函数+中和，真实广告视图不可见");
-}
-
-static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
-static id (*origCYVipInit)(id, SEL);
-static id (*origCYVipInitWithCoder)(id, SEL, NSCoder *);
-
-static id CYVipInitWithFrame(id self, SEL _cmd, CGRect frame) {
-    NSArray *ra = [NSThread callStackReturnAddresses];
-    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
-    return origCYVipInitWithFrame(self, _cmd, frame);
-}
-static id CYVipInit(id self, SEL _cmd) {
-    NSArray *ra = [NSThread callStackReturnAddresses];
-    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
-    return origCYVipInit(self, _cmd);
-}
-static id CYVipInitWithCoder(id self, SEL _cmd, NSCoder *coder) {
-    NSArray *ra = [NSThread callStackReturnAddresses];
-    if (ra.count > 1) CYTryHookVipCreator((uintptr_t)[ra[1] unsignedLongLongValue]);
-    return origCYVipInitWithCoder(self, _cmd, coder);
-}
-
-static void CYInstallVipCreatorProbe(void) {
+static void CYInstallVipSafe(void) {
     Class cls = objc_getClass("ColorfulCloudsPro.CYVipBottomView");
     if (!cls) {
-        CYLog(@"[VipCreator] class ColorfulCloudsPro.CYVipBottomView not found");
+        CYLog(@"[VipSafe] class ColorfulCloudsPro.CYVipBottomView not found");
         return;
     }
-    CYLog(@"[VipCreator] hooked %@ (准备按死创建它的 Swift 方法)", NSStringFromClass(cls));
-    MSHookMessageEx(cls, @selector(initWithFrame:), (IMP)CYVipInitWithFrame, (IMP *)&origCYVipInitWithFrame);
-    MSHookMessageEx(cls, @selector(init), (IMP)CYVipInit, (IMP *)&origCYVipInit);
-    MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoder, (IMP *)&origCYVipInitWithCoder);
+    CYLog(@"[VipSafe] 在 @objc init 处中和 CYVipBottomView（ABI 安全，替代 MSHookFunction 私有 Swift 函数）");
+    MSHookMessageEx(cls, @selector(initWithFrame:), (IMP)CYVipInitWithFrameSafe, (IMP *)&origCYVipInitWithFrame);
+    MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoderSafe, (IMP *)&origCYVipInitWithCoder);
 }
 
 %ctor {
-    CYInstallVipCreatorProbe();
+    CYInstallVipSafe();
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
 }
