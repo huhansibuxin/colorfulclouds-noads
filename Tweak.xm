@@ -16,6 +16,7 @@
 #import <objc/message.h>
 #import <substrate.h>
 #import <dlfcn.h>
+#import <string.h>
 
 // Logos 只生成 @class 前向声明，访问继承来的成员或自己的方法必须先声明。
 // 属性一律走 KVC（valueForKey:）访问，避免和真实类型耦合。
@@ -69,7 +70,6 @@ static void CYLog(NSString *fmt, ...) {
         [fh writeData:data];
         [fh closeFile];
     }
-    NSLog(@"[CaiYunRemoveAds] %@", msg);
 }
 
 #pragma mark - 会员/广告文案关键词
@@ -168,9 +168,7 @@ static void CYHideChatButton(id tbc, NSString *when) {
             changed = YES;
         }
         if (changed) {
-            CYLog(@"[Chat] hid chatButton via %@ (btn=%@ bg=%@)", when,
-                  chatBtn ? NSStringFromClass([chatBtn class]) : @"nil",
-                  chatBg ? NSStringFromClass([chatBg class]) : @"nil");
+            CYLog(@"[Chat] chatButton hidden via %@", when);
         }
     } @catch (NSException *e) {
         CYLog(@"[Chat] KVC chatButton failed @%@: %@", when, e.reason);
@@ -188,7 +186,6 @@ static void CYHideChatButton(id tbc, NSString *when) {
 }
 
 - (void)setIsShowChat:(BOOL)show {
-    CYLog(@"[Chat] setIsShowChat:%d -> force NO", show);
     %orig(NO);
 }
 
@@ -276,36 +273,51 @@ static void CYHideChatButton(id tbc, NSString *when) {
 // 第一层：硬编码黑名单——静态分析已知的会员类，不管形态直接拉黑；
 // 第二层：组合判断——"会员语义" + "浮层形态"都命中才拦。
 // 只针对浮层视图，绝不碰 ViewController 的根 view，所以会员中心等正常业务页不会被误伤。
-static BOOL CYIsAdOverlayClassName(NSString *cls) {
-    if (!cls.length) return NO;
-    // ① 硬编码黑名单（来自静态 class-dump，改名后靠 [Overlay] 日志再补）
-    static NSSet *hard = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        hard = [NSSet setWithObjects:
-            @"ColorfulCloudsPro.CYPayLaunchView",
-            @"ColorfulCloudsPro.CYPayLaunchOtherView",
-            @"ColorfulCloudsPro.CYMemberBottomView",
-            @"ColorfulCloudsPro.CYVipBottomView",
-            @"ColorfulCloudsPro.CYMemberToastView",
-            @"ColorfulCloudsPro.CYGetSvipToastView",
-            @"ColorfulCloudsPro.CYLightupSVIPBottomToastView",
-            @"ColorfulCloudsPro.CYOneSVIPBottomToastView",
-            @"ColorfulCloudsPro.CYChatPayToastView",
-            @"ColorfulCloudsPro.CYMemberBackToastView",
-            @"ColorfulCloudsPro.CYMemberPayButtonView",
-            nil];
-    });
-    if ([hard containsObject:cls]) return YES;
-    // ② 组合判断兜底
-    NSString *lo = cls.lowercaseString;
-    if ([cls hasSuffix:@"PayLaunchView"]) return YES;
-    if ([cls hasSuffix:@"PayLaunchOtherView"]) return YES;
-    BOOL memberish = [lo containsString:@"svip"] || [lo containsString:@"vip"] ||
-                     [lo containsString:@"member"] || [lo containsString:@"pay"];
-    BOOL overlay = [lo containsString:@"toast"] || [lo containsString:@"popup"] ||
-                   [lo containsString:@"launch"] || [lo containsString:@"banner"] ||
-                   [lo containsString:@"activity"] || [lo containsString:@"advert"];
+// 大小写不敏感子串搜索（避免依赖 strcasestr 声明，编译更稳）
+static const char *CYStrCaseless(const char *hay, const char *needle) {
+    if (!hay || !needle) return NULL;
+    size_t hlen = strlen(hay), nlen = strlen(needle);
+    if (nlen == 0 || hlen < nlen) return NULL;
+    for (size_t i = 0; i <= hlen - nlen; i++) {
+        size_t j = 0;
+        for (; j < nlen; j++) {
+            char a = hay[i+j]; if (a >= 'A' && a <= 'Z') a += 32;
+            char b = needle[j]; if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+        }
+        if (j == nlen) return hay + i;
+    }
+    return NULL;
+}
+
+static BOOL CYIsAdOverlayClassName(const char *cls) {
+    if (!cls || !*cls) return NO;
+    // ① 硬编码黑名单（来自静态 class-dump，改名后靠 [Overlay] 日志再补）。用 C 字符串比较，
+    //    不走 NSString/NSArray，避免热路径上的对象分配。
+    static const char *hard[] = {
+        "ColorfulCloudsPro.CYPayLaunchView",
+        "ColorfulCloudsPro.CYPayLaunchOtherView",
+        "ColorfulCloudsPro.CYMemberBottomView",
+        "ColorfulCloudsPro.CYVipBottomView",
+        "ColorfulCloudsPro.CYMemberToastView",
+        "ColorfulCloudsPro.CYGetSvipToastView",
+        "ColorfulCloudsPro.CYLightupSVIPBottomToastView",
+        "ColorfulCloudsPro.CYOneSVIPBottomToastView",
+        "ColorfulCloudsPro.CYChatPayToastView",
+        "ColorfulCloudsPro.CYMemberBackToastView",
+        "ColorfulCloudsPro.CYMemberPayButtonView",
+        NULL
+    };
+    for (int i = 0; hard[i]; i++) if (strcmp(cls, hard[i]) == 0) return YES;
+    // ② 组合判断兜底（后缀 / 语义+形态）
+    size_t len = strlen(cls);
+    if (len >= 13 && strcmp(cls + len - 13, "PayLaunchView") == 0) return YES;
+    if (len >= 17 && strcmp(cls + len - 17, "PayLaunchOtherView") == 0) return YES;
+    BOOL memberish = CYStrCaseless(cls, "svip") || CYStrCaseless(cls, "vip") ||
+                     CYStrCaseless(cls, "member") || CYStrCaseless(cls, "pay");
+    BOOL overlay = CYStrCaseless(cls, "toast") || CYStrCaseless(cls, "popup") ||
+                   CYStrCaseless(cls, "launch") || CYStrCaseless(cls, "banner") ||
+                   CYStrCaseless(cls, "activity") || CYStrCaseless(cls, "advert");
     return memberish && overlay;
 }
 
@@ -330,16 +342,16 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
     UIWindow *win = self.window;
     if (!win) return;
 
-    NSString *cls = NSStringFromClass([self class]);
+    const char *cls = class_getName([self class]);
     BOOL onWindow = (self.superview == win);
     // 兜底 A：直接挂 window 的"居中卡片"浮层一律当弹窗干掉（不挑业务，全拦）
     if (onWindow && CYLooksLikePopupOverlay(self, win)) {
-        CYLog(@"[Overlay] popup-like %@ -> hidden", cls);
+        CYLog(@"[Overlay] popup-like %s -> hidden", cls);
         self.hidden = YES;
     }
     // 兜底 B：类名带会员/付费语义的浮层，直接隐藏
     if (CYIsAdOverlayClassName(cls)) {
-        CYLog(@"[AdOverlay] hid %@", cls);
+        CYLog(@"[AdOverlay] hid %s", cls);
         self.hidden = YES;
         // 广告容器本身也一起摘掉，避免留下透明遮罩挡住点击
         if (self.superview && self.superview != win) {
@@ -347,22 +359,23 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
             if (container.subviews.count <= 2 &&
                 container.frame.size.width >= win.bounds.size.width * 0.8) {
                 container.hidden = YES;
-                CYLog(@"[AdOverlay] hid container %@", NSStringFromClass([container class]));
+                CYLog(@"[AdOverlay] hid container %s", class_getName([container class]));
             }
         }
     }
     // 漏网定位（零噪音）：非系统类、直接挂 window、宽度 ≥ 30% 屏幕的可疑浮层，
     // 同类只记一次。平时几乎不写；真弹窗出现时（无论拦没拦住）都会留下类名和尺寸，
     // 方便从日志反推是哪一层没兜住。
-    if (onWindow && ![cls hasPrefix:@"UI"] && ![cls hasPrefix:@"_UI"]) {
+    if (onWindow && strncmp(cls, "UI", 2) != 0 && strncmp(cls, "_UI", 3) != 0) {
         CGRect f = self.frame;
         if (f.size.width >= win.bounds.size.width * 0.30) {
             static NSMutableSet *seen = nil;
             static dispatch_once_t once;
             dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-            if (![seen containsObject:cls]) {
-                [seen addObject:cls];
-                CYLog(@"[Overlay] %@ f=(%.0f,%.0f,%.0f,%.0f)",
+            NSString *key = [NSString stringWithUTF8String:cls];
+            if (![seen containsObject:key]) {
+                [seen addObject:key];
+                CYLog(@"[Overlay] %s f=(%.0f,%.0f,%.0f,%.0f)",
                       cls, f.origin.x, f.origin.y, f.size.width, f.size.height);
             }
         }
@@ -451,7 +464,7 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 
 %end
 
-#pragma mark - 临时诊断：抓 CYVipBottomView 创建栈（定位源头后删除）
+#pragma mark - CYVipBottomView 兜底中和（@objc init 安全 swizzle，主拦截的补充层）
 
 // 安全"按死"源头（ABI 安全版）：在 CYVipBottomView 的 @objc 初始化方法里，调用原始 init
 // 拿到真实实例，立即隐藏+禁交互。CYVipBottomView 是 UIView 子类，initWithFrame:/initWithCoder:
@@ -475,11 +488,7 @@ static id CYVipInitWithCoderSafe(id self, SEL _cmd, NSCoder *coder) {
 
 static void CYInstallVipSafe(void) {
     Class cls = objc_getClass("ColorfulCloudsPro.CYVipBottomView");
-    if (!cls) {
-        CYLog(@"[VipSafe] class ColorfulCloudsPro.CYVipBottomView not found");
-        return;
-    }
-    CYLog(@"[VipSafe] 在 @objc init 处中和 CYVipBottomView（ABI 安全，替代 MSHookFunction 私有 Swift 函数）");
+    if (!cls) return;
     MSHookMessageEx(cls, @selector(initWithFrame:), (IMP)CYVipInitWithFrameSafe, (IMP *)&origCYVipInitWithFrame);
     MSHookMessageEx(cls, @selector(initWithCoder:), (IMP)CYVipInitWithCoderSafe, (IMP *)&origCYVipInitWithCoder);
 }
@@ -494,18 +503,20 @@ static void CYInstallVipSafe(void) {
 // 中和作为兜底。
 static void (*origUIViewDidAddSubview)(id, SEL, UIView *) = NULL;
 
+// 会员/付费底部浮层判定（C 字符串 + 前缀预筛，热路径零对象分配）。
+// 关键优化：彩云私有类都在 "ColorfulCloudsPro.CY" 命名空间，正常视图（UILabel/UIView/
+// 系统 _UI* 等）首字符不匹配 -> 直接跳过，不进黑名单比较，开销可忽略。
 static BOOL CYIsMemberPayBottomView(UIView *v) {
     if (!v) return NO;
-    NSString *cn = NSStringFromClass([v class]);
-    static NSArray<NSString *> *black = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        black = @[@"CYVipBottomView", @"CYMemberBottomView", @"CYMemberAPayView",
-                  @"CYMemberPayButtonView", @"CYPayLaunchView", @"CYPayLaunchOtherView",
-                  @"CYLightupSVIPBottomToastView", @"CYFlowerBottomView",
-                  @"CYGuidePayView", @"CYVipRightsView"];
-    });
-    for (NSString *p in black) { if ([cn containsString:p]) return YES; }
+    const char *name = class_getName([v class]);
+    if (strncmp(name, "ColorfulCloudsPro.CY", 18) != 0) return NO;
+    static const char *black[] = {
+        "CYVipBottomView", "CYMemberBottomView", "CYMemberAPayView",
+        "CYMemberPayButtonView", "CYPayLaunchView", "CYPayLaunchOtherView",
+        "CYLightupSVIPBottomToastView", "CYFlowerBottomView",
+        "CYGuidePayView", "CYVipRightsView", NULL
+    };
+    for (int i = 0; black[i]; i++) if (strstr(name, black[i])) return YES;
     return NO;
 }
 
@@ -515,12 +526,11 @@ static void CYUIViewDidAddSubview(id self, SEL _cmd, UIView *subview) {
         [subview removeFromSuperview];
         [subview setHidden:YES];
         [subview setUserInteractionEnabled:NO];
-        CYLog(@"[VipSafe] didAddSubview 中和 %@（零闪烁主拦截）", NSStringFromClass([subview class]));
+        CYLog(@"[VipSafe] blocked %s", class_getName([subview class]));
     }
 }
 
 static void CYInstallDidAddSubviewGuard(void) {
-    CYLog(@"[VipSafe] 已安装 UIView didAddSubview: 主拦截（零闪烁，全局）");
     MSHookMessageEx([UIView class], @selector(didAddSubview:), (IMP)CYUIViewDidAddSubview, (IMP *)&origUIViewDidAddSubview);
 }
 
