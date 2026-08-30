@@ -467,16 +467,21 @@ static uintptr_t CYVipCreatorNoop(void) {
     return 0;
 }
 
-// 从调用点返回地址（位于创建方法体内）向后扫描解密后的 __TEXT，
-// 定位函数入口序言：stp x29,x30,[sp,#-imm]!  => 小端字节 FD FE ?? A9
+// 从调用点返回地址（位于创建方法体内）向后扫描解密后的 __TEXT，定位函数入口序言。
+// 标准函数序言 stp x29,x30,[sp,#-imm]! 的小端机器码 = [0xFD, <imm 变>, 0xBF, 0xA9]
+//   byte0=0xFD (Rt=x29)  byte2=0xBF (Rt2=x30)  byte3=0xA9 (store-pair pre-index)
+//   byte1 随栈帧偏移变化，不能作为匹配项。故只卡 byte0/byte2/byte3 三个固定字节。
 static uintptr_t CYFindFunctionEntry(uintptr_t retAddr) {
     uintptr_t start = retAddr & ~(uintptr_t)0x3;
     for (uintptr_t p = start; p > start - 16384; p -= 4) {
         uint32_t insn = *(volatile uint32_t *)p;
         uint8_t b0 = (uint8_t)(insn & 0xFF);
-        uint8_t b1 = (uint8_t)((insn >> 8) & 0xFF);
+        uint8_t b2 = (uint8_t)((insn >> 16) & 0xFF);
         uint8_t b3 = (uint8_t)((insn >> 24) & 0xFF);
-        if (b0 == 0xFD && b1 == 0xFE && b3 == 0xA9) return p; // 命中序言 = 函数入口
+        // 主匹配：stp x29,x30,[sp,#-imm]!（函数入口最通用的序言）
+        if (b0 == 0xFD && b2 == 0xBF && b3 == 0xA9) return p;
+        // 兜底：stp x20,x19,[sp,#-imm]!（部分 Swift 方法先压其它寄存器）
+        if (b0 == 0xA0 && b2 == 0xA7 && b3 == 0xA9) return p;
     }
     return 0;
 }
