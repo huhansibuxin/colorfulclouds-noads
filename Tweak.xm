@@ -461,23 +461,26 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
 // 再用 MSHookFunction 把它按死(no-op)。只杀"创建 VIP 底部浮层"这一处，不碰
 // CYConfigureHeadView 本身，因此会员配置页不会因 IBOutlet 强解包而崩溃。
 static BOOL gVipCreatorHooked = NO;
+// 原始创建函数指针（MSHookFunction 回传），用于"调用原函数 + 当场中和"的安全按死
+static id (*gOrigVipCreator)(id, SEL) = NULL;
 
-// 安全"按死"：替换创建方法，不执行真实 SVIP 广告构建逻辑，而是返回一个非 nil 的
-// 空白 CYVipBottomView 实例（立即隐藏+禁交互）。这样：
-//  1) 真实的 SVIP 广告视图/数据拉取逻辑不再执行（从源头掐断猫鼠重建，CPU 不再空转）；
-//  2) 调用方拿到非 nil 实例，Swift 非可选强解包不会崩溃（设置页等路径不再崩）。
-// 注意：创建方法是共享的（设置页会员配置头也走它），返回 nil 会让强解包路径崩溃，
-// 故必须用"空白实例"而非 nil。alloc+initWithFrame: 走的是已被 hook 的 initWithFrame:，
-// 且 gVipCreatorHooked 已置位不会重入本替换，无递归风险。
+// 安全"按死"：调用原始创建函数拿到**真实（含子视图、用正确 frame）**的 CYVipBottomView
+// 实例，再当场 removeFromSuperview + 隐藏 + 禁交互 + 归零 frame，返回该真实实例。这样：
+//  1) 不踩零 frame 崩溃（原始函数用正确 frame 构建，内部布局/子视图齐全）；
+//  2) 返回非 nil 真实实例，调用方 Swift 强解包（含其子视图）不会崩溃 -> 设置页不再崩；
+//  3) 浮层被中和（不可见、不接收事件），从源头拦截弹窗，同时 didMoveToWindow 仍兜底。
+// 注：创建方法是共享函数（设置页会员配置头也走它），只能"建真实例再隐藏"，不能返回 nil
+// 或空白实例。gVipCreatorHooked 已置位，原函数内部的 initWithFrame: 不会再触发本替换。
 static id CYVipCreatorSafe(id self, SEL _cmd) {
-    Class cls = objc_getClass("ColorfulCloudsPro.CYVipBottomView");
-    id v = cls ? [[cls alloc] initWithFrame:CGRectZero] : nil;
-    if (v) {
+    id v = gOrigVipCreator ? gOrigVipCreator(self, _cmd) : nil;
+    if (v && [v isKindOfClass:[UIView class]]) {
+        [v removeFromSuperview];
         [v setHidden:YES];
         [v setUserInteractionEnabled:NO];
-        CYLog(@"[VipKill] 已用空白实例替换真实 SVIP 创建（非 nil，防强解包崩溃）");
+        [v setFrame:CGRectZero];
+        CYLog(@"[VipKill] 已调用原函数并中和真实 SVIP 实例（非 nil，防强解包崩溃）");
     } else {
-        CYLog(@"[VipKill] 空白实例创建失败 -> 回退浮层 hide");
+        CYLog(@"[VipKill] 原函数返回 nil -> 回退浮层 hide");
     }
     return v;
 }
@@ -513,8 +516,8 @@ static void CYTryHookVipCreator(uintptr_t retAddr) {
     if (dladdr((void *)entry, &info)) { fname = info.dli_fname ? info.dli_fname : "?"; base = (uintptr_t)info.dli_fbase; }
     CYLog(@"[VipKill] 创建方法入口=0x%lx (off=0x%lx) img=%s",
           (unsigned long)entry, (unsigned long)(entry - base), fname);
-    MSHookFunction((void *)entry, (void *)CYVipCreatorSafe, NULL);
-    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> 返回空白实例，真实广告视图不再构建");
+    MSHookFunction((void *)entry, (void *)CYVipCreatorSafe, (void **)&gOrigVipCreator);
+    CYLog(@"[VipKill] 已按死创建方法(MSHookFunction) -> 调用原函数+中和，真实广告视图不可见");
 }
 
 static id (*origCYVipInitWithFrame)(id, SEL, CGRect);
