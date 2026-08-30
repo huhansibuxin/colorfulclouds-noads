@@ -475,6 +475,12 @@ static void CYLogVipCreatorStack(NSString *stage) {
 // 若 sel 明显是 VIP/付费/会员相关，直接把它按死(no-op)，从根源掐断重建循环；
 // 若是通用布局方法(如 layoutSubviews)则只记录、不自动按死，避免误伤其它 UI。
 static BOOL gVipCreatorResolved = NO;
+
+// 被按死的创建方法的替换实现：整体不执行（它只负责创建/展示 SVIP 底部浮层）
+static void CYVipCreatorKilled(id s, SEL _c) {
+    CYLog(@"[VipKill] blocked -[%@ %@]", NSStringFromClass([s class]), NSStringFromSelector(_c));
+}
+
 static void CYResolveAndKillVipCreator(uintptr_t targetAddr) {
     if (gVipCreatorResolved) return;
     gVipCreatorResolved = YES;
@@ -510,9 +516,7 @@ static void CYResolveAndKillVipCreator(uintptr_t targetAddr) {
                     [lo containsString:@"付费"] || [lo containsString:@"会员"];
     if (looksVip) {
         CYLog(@"[VipKill] 判定为 SVIP/付费/会员 创建方法 -> 按死(no-op)");
-        MSHookMessageEx(bestCls, bestSel, (IMP)^void(id s, SEL _c){
-            CYLog(@"[VipKill] blocked -[%@ %@]", NSStringFromClass(bestCls), NSStringFromSelector(bestSel));
-        }, NULL);
+        MSHookMessageEx(bestCls, bestSel, (IMP)CYVipCreatorKilled, NULL);
     } else {
         CYLog(@"[VipKill] sel 非 VIP 专属(可能是通用布局方法) -> 暂不自动按死，仅记录，待人工确认");
     }
