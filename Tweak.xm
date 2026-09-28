@@ -58,11 +58,18 @@ static void CYLog(NSString *fmt, ...) {
     NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
     NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
     NSString *path = CYLogFileURL().path;
-    // 大小轮转：超过 1.5MB 直接删掉重写（旧日志丢弃，留最近一段）
-    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
-    if (attrs && [attrs fileSize] > CYLogRotateBytes) {
-        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+    // 大小轮转：超过 1.5MB 直接删掉重写（旧日志丢弃，留最近一段）。
+    // v2.0.3：原来每写一条都做一次 attributesOfItemAtPath:（背后是 stat 系统调用），
+    // 属于纯浪费 —— 改成每 32 条查一次。计数竞争最坏只是多 stat 几次，无副作用。
+    static int sinceSizeCheck = 0;
+    if (sinceSizeCheck <= 0) {
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if (attrs && [attrs fileSize] > CYLogRotateBytes) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        }
+        sinceSizeCheck = 32;
     }
+    sinceSizeCheck--;
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
     if (!fh) {
         [[NSFileManager defaultManager] createFileAtPath:path contents:data attributes:nil];
@@ -75,12 +82,15 @@ static void CYLog(NSString *fmt, ...) {
 
 #pragma mark - 会员/广告文案关键词
 
+// 关键词表统一存**小写**形态（v2.0.3）。原来表里混着 "VIP"/"vip"，比对时对每个
+// 关键词现调 lowercaseString，等于每次判定都多分配 3x 个临时 NSString，
+// 还保留了大小写重复项。现在表即小写、去重，比对侧零分配。
 static NSSet<NSString *> *CYAdKeywords(void) {
     static NSSet *set = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         set = [NSSet setWithObjects:
-            @"会员", @"VIP", @"SVIP", @"vip", @"svip",
+            @"会员", @"vip", @"svip",
             @"限时特惠", @"限时优惠", @"限时", @"特惠",
             @"开通会员", @"购买会员", @"升级会员", @"续费", @"到期",
             @"会员优惠券", @"恢复订阅", @"立即开通", @"立即购买",
@@ -94,9 +104,9 @@ static NSSet<NSString *> *CYAdKeywords(void) {
 
 static BOOL CYStringContainsAdKeyword(NSString *text) {
     if (!text.length) return NO;
-    NSString *low = text.lowercaseString;
+    NSString *low = text.lowercaseString;   // 只转原文一次
     for (NSString *kw in CYAdKeywords()) {
-        if ([low containsString:kw.lowercaseString]) return YES;
+        if ([low containsString:kw]) return YES;   // 关键词已是小写，不再转换
     }
     return NO;
 }
@@ -293,6 +303,14 @@ static const char *CYStrCaseless(const char *hay, const char *needle) {
 
 static BOOL CYIsAdOverlayClassName(const char *cls) {
     if (!cls || !*cls) return NO;
+    // v2.0.3 性能修复：本函数在**每个视图上屏时**都会走一次（全局 didMoveToWindow 热路径）。
+    // 下面的硬编码黑名单与组合判断的目标类，全部位于 App 自己的命名空间
+    // （Swift 模块名 ColorfulCloudsPro），所以先用一次 strncmp 把系统类/第三方类整体放行：
+    // 省掉 12 次全名 strcmp，以及最多 10 次 CYStrCaseless —— 后者是 O(串长²) 的双层循环，
+    // 是这里最贵的一项（每个 UIView/UILabel 上屏都要白做上千次字符比较）。
+    // 万一以后出现命名空间外的广告浮层，兜底 A（居中卡片）与兜底 C（面积+文案）都不依赖
+    // 类名，仍能拦住，且探针会写 [Overlay] leak? 留下类名。
+    if (strncmp(cls, "ColorfulCloudsPro.", 18) != 0) return NO;
     // ① 硬编码黑名单（来自静态 class-dump，改名后靠 [Overlay] 日志再补）。用 C 字符串比较，
     //    不走 NSString/NSArray，避免热路径上的对象分配。
     static const char *hard[] = {
@@ -480,8 +498,13 @@ static void CYLateWindowCheck(UIView *v) {
 
     const char *cls = class_getName([self class]);
 
-    // 兜底 B（最便宜的一层）：类名带会员/付费/活动语义的浮层直接隐藏。纯 C 字符串
-    // 黑名单、零对象分配，放在最前面执行，命中即不必再走后面的几何/层级判定。
+    // v2.0.3：系统容器视图（UI* / _UI*，如 UITransitionView / UILayoutContainerView）是页面
+    // 骨架，先判先出。这一条命中率最高（首页绝大多数视图都是 UIView/UILabel/UIImageView 等
+    // 系统类），放在最前面可以让后面那次类名黑名单比对整个跳过 —— 纯粹白捡的顺序优化。
+    if ((strncmp(cls, "UI", 2) == 0) || (strncmp(cls, "_UI", 3) == 0)) return;
+
+    // 兜底 B（便宜层）：类名带会员/付费/活动语义的浮层直接隐藏。纯 C 字符串黑名单，
+    // 内部还有一次命名空间前缀预筛，零对象分配。
     if (CYIsAdOverlayClassName(cls)) {
         CYLog(@"[AdOverlay] hid %s", cls);
         self.hidden = YES;
@@ -497,18 +520,20 @@ static void CYLateWindowCheck(UIView *v) {
         return;
     }
 
-    // 系统容器视图（UI* / _UI*，如 UITransitionView / UILayoutContainerView）= 页面骨架，不碰
-    if ((strncmp(cls, "UI", 2) == 0) || (strncmp(cls, "_UI", 3) == 0)) return;
-
     // 热路径短路：面积门槛先算，按钮/文字/图标等绝大多数控件在这里就被排除，
     // 下面"超级视图链 + 子树文案扫描"这两项相对昂贵的操作只在极少数够大的视图上执行。
     // 门槛取 0.06（约 1/16 屏）—— 老板实机观察这个会员卡弹窗"居中、不大、最多四分之一屏"
     // （约 0.25），旧版门槛是 0.50（半屏），根本够不着它，这是上一轮没拦住的直接原因。
     CGFloat ratio = CYViewAreaRatio(self, win);
     if (ratio < 0.06) {
-        // 尺寸还没算出来 —— 可能是"上屏那一帧 autolayout 尚未布局"，也可能是真的小控件。
-        // 交给兜底 D 排一次主队列复核（只对窗口级浮层候选排队，正常页面零开销）。
-        CYLateWindowCheck(self);
+        // 尺寸还没算出来（上屏那一帧 autolayout 尚未布局），也可能就是真的小控件。
+        // v2.0.3 性能修复：这里绝不能对所有小视图排延迟复核 —— CYLateWindowCheck 第一步
+        // 就是 isDescendantOfView: 沿 superview 链向上遍历，而一次首页加载会有上千个
+        // 小控件（按钮/图标/分隔线/label）上屏，等于给每个控件都做一次链遍历。
+        // 这正是"打开卡一下、反应变慢"的主要来源（上一版注释写"正常页面零开销"是错的）。
+        // 收紧成 O(1) 判据：只有"父视图就是 window"这种明确的窗口级浮层才值得延迟复核；
+        // 页面内的小视图（父视图是普通容器）在这里一次指针比较就出去了。
+        if (self.superview == win) CYLateWindowCheck(self);
         return;
     }
 
@@ -846,17 +871,34 @@ static BOOL CYIsSystemClassName(const char *cn) {
     return NO;
 }
 
+// 类表缓存（v2.0.3 性能修复）。objc_copyClassList 每次调用都要进 objc 运行时取锁，
+// 并**把整张类表 malloc 拷贝一份**（本机 3000+ 类，几十 KB + 全表遍历）。
+// 之前 4 个 selector 各调一次 = 白扫四遍全表；装弹又跑两轮（%ctor 一次 + 1.2s 补装一次）
+// → 最坏 8 次全表拷贝，全部发生在 App 启动的关键路径上。这是"打开变慢"的第一元凶。
+// 现在只拷一份全局复用；只有延时补装那一轮强制刷新（Swift 类可能注册得比本 dylib 晚）。
+static Class *gClassList = NULL;
+static unsigned int gClassCount = 0;
+
+static void CYRefreshClassList(BOOL force) {
+    if (gClassList && !force) return;
+    if (gClassList) {
+        free(gClassList);
+        gClassList = NULL;
+        gClassCount = 0;
+    }
+    gClassList = objc_copyClassList(&gClassCount);
+}
+
 static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return 0;
+    if (!gClassList) return 0;
+    const unsigned int count = gClassCount;
     unsigned int found = 0;
 
     for (int pass = 0; pass < 2 && found < maxOut; pass++) {
         // 第一轮已经拿到 App 自己的宿主 → 不再碰任何外部类（避免误伤系统框架）
         if (pass == 1 && found > 0) break;
         for (unsigned int i = 0; i < count && found < maxOut; i++) {
-            Class c = classes[i];
+            Class c = gClassList[i];
             const char *cn = class_getName(c);
             if (!cn) continue;
             BOOL isNS = (strncmp(cn, "ColorfulCloudsPro.", 18) == 0);
@@ -891,7 +933,6 @@ static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
         }
     }
 
-    free(classes);
     return found;
 }
 
@@ -904,15 +945,22 @@ static const char *CYHostTypeEncoding(Class hookTarget, SEL sel) {
     return m ? method_getTypeEncoding(m) : NULL;
 }
 
-static void CYInstallPopupGate(void) {
+static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
+    double t0 = [NSDate timeIntervalSinceReferenceDate];
     // 扩展进程（.appex：widget / 通知扩展…）里没有首页弹窗，跳过 —— 省掉一次全类表
     // 扫描，也避免同一份日志被两个进程各写一遍（实测日志里出现过两批相隔 10s 的装弹记录）。
-    static NSString *bundlePath = nil;
-    if (!bundlePath) bundlePath = [[NSBundle mainBundle] bundlePath];
-    if ([bundlePath hasSuffix:@".appex"]) return;
+    // 结果缓存进 static：hasSuffix: 不必每次唤醒都做一遍字符串比较。
+    static int isExtension = -1;
+    if (isExtension < 0) {
+        isExtension = [[[NSBundle mainBundle] bundlePath] hasSuffix:@".appex"] ? 1 : 0;
+    }
+    if (isExtension) return;
 
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gPopupGateArmed = [NSMutableSet set]; });
+
+    // 类表只拷一份（v2.0.3）。首轮用缓存，延时补装那轮强制刷新一次以纳入晚注册的 Swift 类。
+    CYRefreshClassList(refreshClasses);
 
     NSMutableArray *summary = [NSMutableArray array];
     int total = 0, armedTotal = 0;
@@ -956,21 +1004,43 @@ static void CYInstallPopupGate(void) {
         }
     }
 
-    // 成功路径压缩成一行（老板要求"日志少写"），异常才逐条展开
+    // 成功路径压缩成一行（老板要求"日志少写"），异常才逐条展开。
+    // 额外带一个装弹耗时（含类表扫描）—— 这是量化"有没有拖启动"的直接证据，
+    // 精确到 0.1ms，且不增加日志行数。
+    double cost = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
     if (summary.count > 0) {
-        CYLog(@"[PopupGate] armed %d/%d %@", armedTotal, total,
+        CYLog(@"[PopupGate] armed %d/%d %.1fms %@", armedTotal, total, cost,
               [summary componentsJoinedByString:@" "]);
+    } else if (verbose) {
+        // 首轮一行都不打会让人误判成"没装上"（v2.0.0 静默失败白等一整轮的教训）。
+        // 补装轮（verbose=NO）已装齐时不再重复写，日志保持干净。
+        CYLog(@"[PopupGate] armed %d/%d %.1fms (no new gate this round)", armedTotal, total, cost);
     }
 }
 
 %ctor {
+    double t0 = [NSDate timeIntervalSinceReferenceDate];
     CYInstallDidAddSubviewGuard();   // 零闪烁主拦截：任意父视图一加会员/付费子视图就移除
     CYInstallVipSafe();              // 兜底：CYVipBottomView 出生即隐藏（@objc init 中和）
-    CYInstallPopupGate();            // 根治层：清空首页营销弹窗队列（队列空 = 一个都不弹）
-    // Swift 侧类注册可能晚于本 dylib 的 %ctor，延时补装一次（已装过则自动跳过）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        CYInstallPopupGate();
+    // 上面两层都是 O(1) 的 MSHookMessageEx（无任何扫描），留在这里没问题。
+    double ctorCost = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
+
+    // 总闸装弹必须扫全类表 —— 绝不能留在启动关键路径上。%ctor 执行于 dyld 加载本 dylib
+    // 的那一帧，它阻塞主线程多久，App 启动就慢多久（这是"打开变慢"的元凶）。
+    // 改为丢到后台串行队列执行：日志量不变（仍是原来那一行，只多了耗时字段）。
+    // 时序安全性：弹窗解析发生在网络返回之后（数百 ms 起），后台装弹完全来得及；
+    // 1.2s 处再补装一轮作为双保险，覆盖 Swift 类注册晚于本 dylib 的情况。
+    static dispatch_queue_t gateQueue = NULL;
+    static dispatch_once_t qOnce;
+    dispatch_once(&qOnce, ^{
+        gateQueue = dispatch_queue_create("com.huhansibuxin.caiyun.gate", DISPATCH_QUEUE_SERIAL);
     });
-    CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
+    dispatch_async(gateQueue, ^{ CYInstallPopupGate(NO, YES); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   gateQueue, ^{
+        CYInstallPopupGate(YES, NO);
+    });
+
+    CYLog(@"[CaiYunRemoveAds] loaded (ctor %.2fms) for %@",
+          ctorCost, [[NSBundle mainBundle] bundleIdentifier]);
 }
