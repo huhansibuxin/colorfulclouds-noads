@@ -17,6 +17,7 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <stdlib.h>
 
 // Logos 只生成 @class 前向声明，访问继承来的成员或自己的方法必须先声明。
 // 属性一律走 KVC（valueForKey:）访问，避免和真实类型耦合。
@@ -306,6 +307,9 @@ static BOOL CYIsAdOverlayClassName(const char *cls) {
         "ColorfulCloudsPro.CYChatPayToastView",
         "ColorfulCloudsPro.CYMemberBackToastView",
         "ColorfulCloudsPro.CYMemberPayButtonView",
+        // 静态分析确认存在（源码路径 ColorfulCloudsPro/CYNotificationPopupActivityView.swift）：
+        // 通知弹窗式活动视图，属于首页营销弹窗队列的一类渲染结果，兜底一并拉黑。
+        "ColorfulCloudsPro.CYNotificationPopupActivityView",
         NULL
     };
     for (int i = 0; hard[i]; i++) if (strcmp(cls, hard[i]) == 0) return YES;
@@ -514,7 +518,8 @@ static BOOL CYIsMemberPayBottomView(UIView *v) {
         "CYVipBottomView", "CYMemberBottomView", "CYMemberAPayView",
         "CYMemberPayButtonView", "CYPayLaunchView", "CYPayLaunchOtherView",
         "CYLightupSVIPBottomToastView", "CYFlowerBottomView",
-        "CYGuidePayView", "CYVipRightsView", NULL
+        "CYGuidePayView", "CYVipRightsView",
+        "CYNotificationPopupActivityView", NULL
     };
     for (int i = 0; black[i]; i++) if (strstr(name, black[i])) return YES;
     return NO;
@@ -534,8 +539,129 @@ static void CYInstallDidAddSubviewGuard(void) {
     MSHookMessageEx([UIView class], @selector(didAddSubview:), (IMP)CYUIViewDidAddSubview, (IMP *)&origUIViewDidAddSubview);
 }
 
+#pragma mark - 营销弹窗总闸：运行时定位调度中心 + 清空首页弹窗队列（根治层）
+
+// 静态分析（IPA 主二进制，类名段未加密）确认：App 的营销弹窗不是"各自随机弹"，
+// 而是"队列式顺序派发"：
+//   服务端下发字典 → popupsArrWithDict: → setHomePopupArray:（存入首页弹窗队列）
+//   → handlePopupArray: → handleNextPopup（按 currenPopupIndex 逐个弹）
+//   → 按 popupId / popupStyles 渲染成具体 View。
+// 埋点事件名直接泄露了完整业务面：
+//   activity_discount_popup_show/close、member_retain_popup、exit_popup_return_gift、
+//   feature_promotion_popup_show、lightup_spring_promotion_popup、coupon_pay_popup、
+//   before_expiration_popup、generic_payment_popup、referral_card_popup …
+// 中文文案交叉验证命中：
+//   「先不看 / 去看看 / 已经是会员啦 / 已经购买过优惠，暂时无法购买」+
+//   「弹窗活动后不展示开屏 / 一日卡第一次弹出时间：%@」
+//   —— 即用户看到的会员卡（年卡）营销弹窗。
+//
+// v1.x 的所有做法都是"等弹窗 View 创建之后再隐藏"，属于补丁，必然猫鼠：新增一类
+// 弹窗就要补一次黑名单。这里改在**队列入队口直接把队列置空** —— 弹窗从未进入渲染
+// 流程：零闪烁、零创建开销，且完全不依赖具体类名/弹窗类型，服务端换新活动弹窗、
+// App 升级版本都一并失效。
+//
+// 宿主类名不做硬编码：运行时在 ColorfulCloudsPro 命名空间里找"真正实现
+// setHomePopupArray: 的类"再 swizzle（行为定位，而非名字定位），改包/换版本通吃。
+
+static void (*origSetHomePopupArray)(id, SEL, NSArray *) = NULL;
+static void (*origHandlePopupArray)(id, SEL, NSArray *) = NULL;
+static NSMutableSet *gPopupGateArmed = nil;
+static int gPopupGateLogCount = 0;
+
+// 取证：把"本来要弹什么"写进日志（队列元素的类名）。命中才记 + 条数上限，避免刷屏。
+static void CYPopupGateRecord(const char *tag, id self, NSArray *arr) {
+    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return;
+    if (gPopupGateLogCount >= 40) return;
+    gPopupGateLogCount++;
+    NSMutableArray *names = [NSMutableArray array];
+    NSUInteger n = arr.count < 8 ? arr.count : 8;
+    for (NSUInteger i = 0; i < n; i++) {
+        id e = arr[i];
+        [names addObject:NSStringFromClass([e class])];
+    }
+    CYLog(@"[PopupGate] %s on %s n=%lu {%@}", tag, class_getName([self class]),
+          (unsigned long)arr.count, [names componentsJoinedByString:@" "]);
+}
+
+// 总闸：入队口清空队列。
+// 传 @[] 而不是 nil —— 该属性是 copy 语义，空数组是合法值，下游按 count 做的
+// 边界判断天然安全（这个队列本来就要支持"今天没有弹窗"的情况）。
+static void CYSetHomePopupArraySafe(id self, SEL _cmd, NSArray *arr) {
+    CYPopupGateRecord("queue", self, arr);
+    if (origSetHomePopupArray) origSetHomePopupArray(self, _cmd, @[]);
+}
+
+// 观测层（不改变行为）：确认清空队列后调度链是否仍被走到、参数是什么。
+// 保留原参数原样转发，只为取证，不参与拦截，避免影响 App 正常流程。
+static void CYHandlePopupArraySafe(id self, SEL _cmd, NSArray *arr) {
+    CYPopupGateRecord("dispatch", self, arr);
+    if (origHandlePopupArray) origHandlePopupArray(self, _cmd, arr);
+}
+
+// 在彩云命名空间内找"真正实现"某 selector 的类（跳过只继承的子类，避免重复 swizzle）
+static Class CYPopupGateHost(SEL sel) {
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return Nil;
+    Class found = Nil;
+    for (unsigned int i = 0; i < count; i++) {
+        Class c = classes[i];
+        const char *cn = class_getName(c);
+        if (!cn || strncmp(cn, "ColorfulCloudsPro.", 18) != 0) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        Class sup = class_getSuperclass(c);
+        Method sm = sup ? class_getInstanceMethod(sup, sel) : NULL;
+        if (sm && method_getImplementation(sm) == method_getImplementation(m)) continue;
+        found = c;
+        break;
+    }
+    free(classes);
+    return found;
+}
+
+// 只对返回 void 的方法挂 hook：彻底规避"返回值类型不匹配"这一类 ABI 坑
+// （v1.7.x 按死私有 Swift 函数崩溃的教训：签名不对就会把调用方带崩）。
+static BOOL CYSelectorReturnsVoid(SEL sel, Class host) {
+    Method m = class_getInstanceMethod(host, sel);
+    if (!m) return NO;
+    const char *enc = method_getTypeEncoding(m);
+    return (enc && enc[0] == 'v');
+}
+
+static void CYInstallPopupGate(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ gPopupGateArmed = [NSMutableSet set]; });
+
+    SEL selSetter = NSSelectorFromString(@"setHomePopupArray:");
+    SEL selDispatch = NSSelectorFromString(@"handlePopupArray:");
+
+    if (![gPopupGateArmed containsObject:@"setter"]) {
+        Class host = CYPopupGateHost(selSetter);
+        if (host) {
+            MSHookMessageEx(host, selSetter, (IMP)CYSetHomePopupArraySafe, (IMP *)&origSetHomePopupArray);
+            [gPopupGateArmed addObject:@"setter"];
+            CYLog(@"[PopupGate] armed setHomePopupArray: on %s", class_getName(host));
+        }
+    }
+    if (![gPopupGateArmed containsObject:@"dispatch"]) {
+        Class host = CYPopupGateHost(selDispatch);
+        if (host && CYSelectorReturnsVoid(selDispatch, host)) {
+            MSHookMessageEx(host, selDispatch, (IMP)CYHandlePopupArraySafe, (IMP *)&origHandlePopupArray);
+            [gPopupGateArmed addObject:@"dispatch"];
+            CYLog(@"[PopupGate] armed handlePopupArray: on %s", class_getName(host));
+        }
+    }
+}
+
 %ctor {
     CYInstallDidAddSubviewGuard();   // 零闪烁主拦截：任意父视图一加会员/付费子视图就移除
     CYInstallVipSafe();              // 兜底：CYVipBottomView 出生即隐藏（@objc init 中和）
+    CYInstallPopupGate();            // 根治层：清空首页营销弹窗队列（队列空 = 一个都不弹）
+    // Swift 侧类注册可能晚于本 dylib 的 %ctor，延时补装一次（已装过则自动跳过）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CYInstallPopupGate();
+    });
     CYLog(@"[CaiYunRemoveAds] loaded for %@", [[NSBundle mainBundle] bundleIdentifier]);
 }

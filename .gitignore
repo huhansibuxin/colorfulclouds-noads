@@ -15,3 +15,6 @@ ipa_unzipped/
 ghidra_projects/
 *.gpr
 *.rep/
+
+# Static analysis output (regenerable via analysis/*.py)
+analysis/*.txt
