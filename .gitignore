@@ -18,3 +18,7 @@ ghidra_projects/
 
 # Static analysis output (regenerable via analysis/*.py)
 analysis/*.txt
+
+# Crash logs (.ips) contain device identifiers - keep local only
+crash/
+*.ips
