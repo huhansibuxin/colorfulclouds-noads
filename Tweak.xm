@@ -486,6 +486,49 @@ static void CYCoverlayProbe(const char *cls, UIView *v, CGFloat ratio) {
           cls, f.origin.x, f.origin.y, f.size.width, f.size.height, ratio);
 }
 
+// 兜底 E（v2.0.5 新增）：页面层级内的「一次性文案探针」—— 只记录，绝不拦截。
+// 背景：上面所有拦截层都有一道人为的安全护栏 —— "位于 rootViewController.view 层级之下的
+// 视图一律跳过"。这条护栏是必需的（会员购买页本身就满屏"立即开通/年卡"，若照拦就会把
+// 用户主动打开的页面打空白），但它留下一个盲区：万一营销弹窗是 addSubview 到当前页面
+// 视图里、而不是盖在其上的窗口级浮层，就会**完全静默穿透** —— 连探针都不写一条。
+// 这里补一条零误伤、零常态开销的观察通道：
+//   · 零误伤 —— 只写日志，不碰任何视图状态；
+//   · 零常态开销 —— ① 面积先预筛（只对"居中卡片"尺度的视图感兴趣）；② 同一类名只处理
+//     一次；③ 全进程上限 CY_INPAGE_PROBE_MAX 条，写满即彻底静默。
+// 于是常态下最多多出十几行一次性日志，之后再无开销；而"弹窗藏在页面层级"这种盲区
+// 一旦发生，日志里一定会出现 `[Overlay] in-page?` + 类名 + 命中文案，可一轮精准收口。
+#define CY_INPAGE_PROBE_MAX 12
+static void CYCoverlayProbeInPage(const char *cls, UIView *v, CGFloat ratio) {
+    if (!cls || !*cls || !v) return;
+    // ① 面积预筛：只关心"居中卡片"尺度（6%~55% 屏）。调用方已保证 ratio >= 0.06。
+    //    独占半屏以上的多半是页面容器/滚动视图，不是弹窗。
+    if (ratio > 0.55) return;
+    // ② 排除系统容器（UITransitionView / UILayoutContainerView…）—— 它们是页面骨架，
+    //    且 App 里的 label/button/icon 全是 UI 前缀，这一条就滤掉了绝大多数视图。
+    if (strncmp(cls, "UI", 2) == 0 || strncmp(cls, "_UI", 3) == 0) return;
+    // ③ 排除 VC 的根视图 = 页面本身（会员页天然满屏"开通/会员"等词，否则必误报）
+    if ([v.nextResponder isKindOfClass:[UIViewController class]]) return;
+
+    // ④ 同类只处理一次。这里刻意用 C 字符串数组而不是 NSMutableSet —— 本函数位于
+    //    didMoveToWindow 热路径上，一次首页加载会有几百个 App 自己的视图上屏，
+    //    每个都做一次 NSString 分配 + 哈希查表是不必要的开销。
+    //    直接存 class_getName 返回的指针即可：那是 runtime 持有的持久字符串，
+    //    只要类还在就不会失效 —— 所以既不用 strdup、也不用管释放（真正零分配）。
+    static const char *seen[CY_INPAGE_PROBE_MAX * 2];
+    static int seenCount = 0, logged = 0;
+    if (logged >= CY_INPAGE_PROBE_MAX) return;                 // ⑤ 全进程上限，写满即静默
+    for (int i = 0; i < seenCount; i++) {
+        if (strcmp(seen[i], cls) == 0) return;
+    }
+    if (seenCount < (int)(sizeof(seen) / sizeof(seen[0]))) seen[seenCount++] = cls;
+    logged++;
+
+    NSString *t = CYSubtreeMarketingText(v, 0);
+    if (t) {
+        CYLog(@"[Overlay] in-page? %s r=%.2f copy=%@", cls, ratio, t);
+    }
+}
+
 // 兜底 D（布局延迟复核）。didMoveToWindow 触发时 autolayout 可能尚未布局，
 // frame/bounds 都还是 0 —— 此时任何基于面积的判据都会漏判，弹窗正好在"上屏那一帧"
 // 溜过 A/C 两层。这个可能性在 v2.0.1 的日志里无法证伪（那一轮没抓到弹窗），所以不赌。
@@ -575,7 +618,13 @@ static void CYLateWindowCheck(UIView *v) {
     // 注：旧版要求 superview == window，弹窗只要挂在任意容器上就整条链静默穿透，
     // 这正是 8/30→9/28 整月零命中的根因。
     UIView *rootView = win.rootViewController.view;
-    if (rootView != NULL && (self == rootView || [self isDescendantOfView:rootView])) return;
+    if (rootView != NULL && (self == rootView || [self isDescendantOfView:rootView])) {
+        // 页面内容：跳过全部拦截判定（防误伤），但走一次"一次性文案探针"——
+        // 只为了在"弹窗藏进页面层级"这一种盲区发生时留下证据（见 CYCoverlayProbeInPage）。
+        // 该函数自带三层收敛（面积预筛 / 同类一次 / 全进程上限），常态开销可忽略。
+        CYCoverlayProbeInPage(cls, self, ratio);
+        return;
+    }
 
     // 兜底 C（最强判据）：子树里出现强运营文案（年卡 / 终身 / 立即开通 / 先不看 / 去看看…）
     NSString *txt = CYSubtreeMarketingText(self, 0);
