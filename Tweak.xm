@@ -804,6 +804,9 @@ CY_GATE_VOID_NOARG(handleNextPopup,      "handleNextPopup")
 CY_GATE_OBJRET_OBJARG(popupsArrWithDict, "popupsArrWithDict:")
 
 static NSMutableSet *gPopupGateArmed = nil;
+// 自愈跳过状态：一旦判定"上一轮装弹崩了"，本进程内（含 1.2s 补装轮）不再尝试装弹。
+// 否则补装轮会再撞一次同一个崩溃点，等于白崩。
+static BOOL gPopupGateSkipped = NO;
 
 // typeEncoding 常带帧偏移数字（如 v24@0:8@16），比对前先剥掉数字
 static void CYNormalizeTypeEncoding(const char *enc, char *out, size_t cap) {
@@ -853,23 +856,24 @@ typedef struct {
     BOOL  isClassMethod;
 } CYGateHost;
 
-// 系统/框架类前缀。第一轮兜底扫描曾经"谁实现同名 selector 就挂谁"，实测踩雷：
-// handleNextPopup 是 v@:（无参无返回），而 UIKeyboardCandidateViewStyle /
-// UIKeyboardCandidateViewState 恰好也有同名同签名方法 → 被一起 swizzle，
-// 而这一档 hook 是"吞掉不转发"，会直接破坏键盘候选条翻页。
-// 但绝不能再退回"过滤掉就算、失败还静默"的老坑，所以策略改成两段式：
-//   第一轮只认 App 自己的命名空间，命中即收工（系统类永远不碰，零误伤）；
-//   第一轮为空才进第二轮兜底，且第二轮显式跳过系统类前缀。
-static BOOL CYIsSystemClassName(const char *cn) {
-    if (!cn || !cn[0]) return YES;
-    static const char *kPrefixes[] = {
-        "UI", "_UI", "NS", "_NS", "CA", "CG", "CF", "AV", "WK", "MK", "SK", "MAMap", "MA", NULL
-    };
-    for (int i = 0; kPrefixes[i]; i++) {
-        if (strncmp(cn, kPrefixes[i], strlen(kPrefixes[i])) == 0) return YES;
-    }
-    return NO;
-}
+// ⚠️⚠️ v2.0.4 关键安全修复：**只扫 App 自己的命名空间，永不扫全表**。
+//
+// 实机崩溃铁证（ColorfulCloudsPro-2026-09-28-230637.ips，bug_type 309 / EXC_BREAKPOINT /
+// SIGTRAP，两次崩溃形态完全一致）：
+//     class_getInstanceMethod          ← 我们在后台队列调它
+//   → lookUpImpOrForward / initializeAndMaybeRelock / CALLING_SOME_+initialize_METHOD
+//   → WebKitInitialize                 ← WebKit 的 +initialize 被触发
+//   → +[WebView enableWebThread] → StartWebThread()
+//   → WTFCrashWithInfo                 ← WebKit 断言"必须主线程"，非主线程直接 trap
+//
+// 两个教训叠加才导致这次闪退：
+//   ① `class_getInstanceMethod` **会给目标类做 realize（跑它的 +initialize）**，不是只读查表；
+//   ② 上一版的「第二轮全量兜底扫描」把**全表所有类**都喂进了它 —— 系统前缀黑名单里写了 "WK"
+//      却没有 "WebView"/"WebCore"，于是 WebKit 的类被扫到，它的 +initialize 在后台线程炸。
+// 结论：任何形式的"全表扫描 + method lookup"都是不可接受的 —— 它会替 App 提前初始化任意框架。
+// 宿主必然是 App 自己的类，所以把范围锁死在 App 命名空间内既安全又够用。
+// 万一命名空间前缀将来不匹配，日志会明确写 NOHOST（失败必留痕），不会静默白等。
+// （上面的教训直接决定了下方 CYGateHosts 的扫描范围：只扫 App 自己的命名空间。）
 
 // 类表缓存（v2.0.3 性能修复）。objc_copyClassList 每次调用都要进 objc 运行时取锁，
 // 并**把整张类表 malloc 拷贝一份**（本机 3000+ 类，几十 KB + 全表遍历）。
@@ -894,45 +898,71 @@ static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
     const unsigned int count = gClassCount;
     unsigned int found = 0;
 
-    for (int pass = 0; pass < 2 && found < maxOut; pass++) {
-        // 第一轮已经拿到 App 自己的宿主 → 不再碰任何外部类（避免误伤系统框架）
-        if (pass == 1 && found > 0) break;
-        for (unsigned int i = 0; i < count && found < maxOut; i++) {
-            Class c = gClassList[i];
-            const char *cn = class_getName(c);
-            if (!cn) continue;
-            BOOL isNS = (strncmp(cn, "ColorfulCloudsPro.", 18) == 0);
-            if (pass == 0 && !isNS) continue;
-            if (pass == 1 && isNS) continue;
-            if (pass == 1 && CYIsSystemClassName(cn)) continue;
+    // 唯一的一轮：只扫 App 自己的命名空间（绝不扫全表的理由见上方注释）
+    for (unsigned int i = 0; i < count && found < maxOut; i++) {
+        Class c = gClassList[i];
+        const char *cn = class_getName(c);
+        if (!cn) continue;
+        if (strncmp(cn, "ColorfulCloudsPro.", 18) != 0) continue;
 
-            Method m = class_getInstanceMethod(c, sel);
-            if (m) {
-                Class sup = class_getSuperclass(c);
-                Method sm = sup ? class_getInstanceMethod(sup, sel) : NULL;
-                if (!(sm && method_getImplementation(sm) == method_getImplementation(m))) {
-                    out[found].hookTarget = c;
-                    out[found].owner = c;
-                    out[found].isClassMethod = NO;
-                    found++;
-                    continue;
-                }
+        Method m = class_getInstanceMethod(c, sel);
+        if (m) {
+            Class sup = class_getSuperclass(c);
+            Method sm = sup ? class_getInstanceMethod(sup, sel) : NULL;
+            if (!(sm && method_getImplementation(sm) == method_getImplementation(m))) {
+                out[found].hookTarget = c;
+                out[found].owner = c;
+                out[found].isClassMethod = NO;
+                found++;
+                continue;
             }
+        }
 
-            Method cm = class_getClassMethod(c, sel);
-            if (cm) {
-                Class sup = class_getSuperclass(c);
-                Method sm = sup ? class_getClassMethod(sup, sel) : NULL;
-                if (!(sm && method_getImplementation(sm) == method_getImplementation(cm))) {
-                    out[found].hookTarget = object_getClass(c);
-                    out[found].owner = c;
-                    out[found].isClassMethod = YES;
-                    found++;
-                }
+        Method cm = class_getClassMethod(c, sel);
+        if (cm) {
+            Class sup = class_getSuperclass(c);
+            Method sm = sup ? class_getClassMethod(sup, sel) : NULL;
+            if (!(sm && method_getImplementation(sm) == method_getImplementation(cm))) {
+                out[found].hookTarget = object_getClass(c);
+                out[found].owner = c;
+                out[found].isClassMethod = YES;
+                found++;
             }
         }
     }
 
+    return found;
+}
+
+// ---- 已知宿主「快路径」（v2.0.4）----
+// 下面这两个类名是 v2.0.2 实机日志里**直接打印出来的**（不是猜的）：
+//   ColorfulCloudsPro.CYMainActivityManager ← setHomePopupArray: / handlePopupArray: / handleNextPopup
+//   ColorfulCloudsPro.CYUtility             ← popupsArrWithDict:
+// 用 objc_getClass 直取是 O(1) 的：不拷类表、不做全表遍历、不碰无关类（也就不会触发
+// 无关类的 realize）。正常路径下**完全不需要 objc_copyClassList**，这是最快也最安全的做法。
+// 类名哪天变了（App 升级 / 改包）→ 返回 0 → 自动回落到命名空间扫描兜底，所以不会失效。
+static const char *kCYGateKnownHosts[] = {
+    "ColorfulCloudsPro.CYMainActivityManager",
+    "ColorfulCloudsPro.CYUtility",
+    NULL
+};
+
+static unsigned int CYGateHostsFast(SEL sel, CYGateHost *out, unsigned int maxOut) {
+    unsigned int found = 0;
+    for (int i = 0; kCYGateKnownHosts[i] && found < maxOut; i++) {
+        Class c = objc_getClass(kCYGateKnownHosts[i]);
+        if (!c) continue;
+        Method m = class_getInstanceMethod(c, sel);
+        if (!m) continue;
+        // 与慢路径同一套判据：只认"真正实现该 selector"的类，跳过仅从父类继承的
+        Class sup = class_getSuperclass(c);
+        Method sm = sup ? class_getInstanceMethod(sup, sel) : NULL;
+        if (sm && method_getImplementation(sm) == method_getImplementation(m)) continue;
+        out[found].hookTarget = c;
+        out[found].owner = c;
+        out[found].isClassMethod = NO;
+        found++;
+    }
     return found;
 }
 
@@ -945,7 +975,23 @@ static const char *CYHostTypeEncoding(Class hookTarget, SEL sel) {
     return m ? method_getTypeEncoding(m) : NULL;
 }
 
-static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
+// ---- 装弹自愈（v2.0.4）----
+// 万一"装弹过程本身"导致崩溃，App 不能永远打不开。装弹前落一个标记文件、成功后删除；
+// 下次启动若发现标记还在 → 说明上一轮装弹崩了 → 本轮跳过装弹（并留日志）。
+// 代价只有一轮：下一次启动会重新尝试装弹。这条与"探针必留痕"同一原则 ——
+// 出问题要让 App 能活、且留下可查的证据，而不是崩到用户没法用。
+static NSString *CYGateCrumbPath(void) {
+    static NSString *p = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *doc = docs.firstObject ?: NSTemporaryDirectory();
+        p = [doc stringByAppendingPathComponent:@"caiyun_gate_pending"];
+    });
+    return p;
+}
+
+static void CYInstallPopupGate(BOOL refreshClasses, BOOL allowScan, BOOL verbose) {
     double t0 = [NSDate timeIntervalSinceReferenceDate];
     // 扩展进程（.appex：widget / 通知扩展…）里没有首页弹窗，跳过 —— 省掉一次全类表
     // 扫描，也避免同一份日志被两个进程各写一遍（实测日志里出现过两批相隔 10s 的装弹记录）。
@@ -959,11 +1005,30 @@ static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gPopupGateArmed = [NSMutableSet set]; });
 
-    // 类表只拷一份（v2.0.3）。首轮用缓存，延时补装那轮强制刷新一次以纳入晚注册的 Swift 类。
-    CYRefreshClassList(refreshClasses);
+    // 自愈优先：本进程已决定跳过装弹（上一轮崩过）→ 直接返回，
+    // 1.2s 补装轮也不会再尝试，避免在同一处崩第二次。
+    if (gPopupGateSkipped) return;
+
+    // 崩溃分界（诊断期临时保留，确认稳定后删）：有 begin 无 armed = 崩在本次装弹内部；
+    // 连 begin 都没有 = 崩在更早（%ctor 或 App 自己的启动流程）。
+    CYLog(@"[Gate] begin (thread=%@)", [NSThread isMainThread] ? @"main" : @"bg");
+
+    // 自愈：先看上一轮的标记是否残留
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *crumb = CYGateCrumbPath();
+    if ([fm fileExistsAtPath:crumb]) {
+        [fm removeItemAtPath:crumb error:nil];
+        gPopupGateSkipped = YES;
+        CYLog(@"[Gate] skipped -- last install attempt crashed; retry on next launch");
+        return;
+    }
+    [fm createFileAtPath:crumb
+                contents:[@"pending" dataUsingEncoding:NSUTF8StringEncoding]
+              attributes:nil];
 
     NSMutableArray *summary = [NSMutableArray array];
     int total = 0, armedTotal = 0;
+    BOOL usedScan = NO;   // 是否走到了"全类表扫描"兜底路径
 
     for (const CYGateTarget *t = kCYGateTargets; t->sel; t++) {
         total++;
@@ -972,7 +1037,25 @@ static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
 
         SEL sel = NSSelectorFromString(key);
         CYGateHost hosts[8];
-        unsigned int n = CYGateHosts(sel, hosts, 8);
+        // v2.0.4：先走已知宿主快路径（objc_getClass 直取，O(1)、零全表扫描、不碰无关类）。
+        // 只有它落空（App 升级改了类名 / 冷启时类尚未注册）才做全类表扫描兜底 —— 这样
+        // 正常路径上 objc_copyClassList 根本不会被调用。
+        unsigned int n = CYGateHostsFast(sel, hosts, 8);
+        if (n == 0) {
+            // 快路径落空才会走到这里。而「扫描 + method lookup」是整个装弹里唯一有风险的
+            // 步骤（class_getInstanceMethod 会触达标的类的 +initialize），所以分两档：
+            //   首轮（allowScan=NO，启动早期）：一律不扫，只记一行留痕，等补装轮再来；
+            //   补装轮（allowScan=YES，1.2s 后 App 已起来）：才允许在命名空间内扫描兜底。
+            // 这样启动关键阶段完全不碰任何无关类，崩溃面收窄到只有改用新版类名时才可能。
+            if (!allowScan) {
+                CYLog(@"[Gate] %@ not in known hosts; will namespace-scan on retry", key);
+                continue;
+            }
+            CYLog(@"[Gate] namespace scan for %@", key);
+            CYRefreshClassList(refreshClasses);
+            usedScan = YES;
+            n = CYGateHosts(sel, hosts, 8);
+        }
         if (n == 0) {
             CYLog(@"[PopupGate] NOHOST %@ -- no class in runtime implements it", key);
             continue;
@@ -1005,17 +1088,22 @@ static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
     }
 
     // 成功路径压缩成一行（老板要求"日志少写"），异常才逐条展开。
-    // 额外带一个装弹耗时（含类表扫描）—— 这是量化"有没有拖启动"的直接证据，
-    // 精确到 0.1ms，且不增加日志行数。
+    // 额外带两个字段：装弹耗时（量化"有没有拖启动"/"有没有拖主线程"）+ 走的是
+    // fastpath（已知宿主直取）还是 scan（全类表兜底），都不增加日志行数。
     double cost = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
     if (summary.count > 0) {
-        CYLog(@"[PopupGate] armed %d/%d %.1fms %@", armedTotal, total, cost,
+        CYLog(@"[PopupGate] armed %d/%d %.1fms %@ %@", armedTotal, total, cost,
+              usedScan ? @"scan" : @"fastpath",
               [summary componentsJoinedByString:@" "]);
     } else if (verbose) {
         // 首轮一行都不打会让人误判成"没装上"（v2.0.0 静默失败白等一整轮的教训）。
         // 补装轮（verbose=NO）已装齐时不再重复写，日志保持干净。
-        CYLog(@"[PopupGate] armed %d/%d %.1fms (no new gate this round)", armedTotal, total, cost);
+        CYLog(@"[PopupGate] armed %d/%d %.1fms %@ (no new gate this round)", armedTotal, total, cost,
+              usedScan ? @"scan" : @"fastpath");
     }
+
+    // 整段跑完 → 清掉崩溃标记（下次启动可正常装弹）
+    [fm removeItemAtPath:crumb error:nil];
 }
 
 %ctor {
@@ -1025,22 +1113,20 @@ static void CYInstallPopupGate(BOOL refreshClasses, BOOL verbose) {
     // 上面两层都是 O(1) 的 MSHookMessageEx（无任何扫描），留在这里没问题。
     double ctorCost = ([NSDate timeIntervalSinceReferenceDate] - t0) * 1000.0;
 
-    // 总闸装弹必须扫全类表 —— 绝不能留在启动关键路径上。%ctor 执行于 dyld 加载本 dylib
-    // 的那一帧，它阻塞主线程多久，App 启动就慢多久（这是"打开变慢"的元凶）。
-    // 改为丢到后台串行队列执行：日志量不变（仍是原来那一行，只多了耗时字段）。
-    // 时序安全性：弹窗解析发生在网络返回之后（数百 ms 起），后台装弹完全来得及；
-    // 1.2s 处再补装一轮作为双保险，覆盖 Swift 类注册晚于本 dylib 的情况。
-    static dispatch_queue_t gateQueue = NULL;
-    static dispatch_once_t qOnce;
-    dispatch_once(&qOnce, ^{
-        gateQueue = dispatch_queue_create("com.huhansibuxin.caiyun.gate", DISPATCH_QUEUE_SERIAL);
-    });
-    dispatch_async(gateQueue, ^{ CYInstallPopupGate(NO, YES); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   gateQueue, ^{
-        CYInstallPopupGate(YES, NO);
-    });
-
     CYLog(@"[CaiYunRemoveAds] loaded (ctor %.2fms) for %@",
           ctorCost, [[NSBundle mainBundle] bundleIdentifier]);
+
+    // 总闸装弹：v2.0.4 修正 —— **必须回主线程**。
+    // v2.0.3 为了不拖启动把它丢进了后台队列，结果启动即闪退（实机三次启动只有 loaded、
+    // 一行 armed 都没有）。根因是启动早期在非主线程做 runtime 操作：class_getInstanceMethod
+    // 会触发类的 realize（跑 +initialize），swizzle 还要与正在启动的主线程抢 runtime 锁 ——
+    // 这是经典崩法，不能赌。
+    // 现在改成「主队列异步」：依然不在 %ctor 帧（dyld 加载帧）内执行，所以不占启动关键路径；
+    // 但落在启动后第一个 runloop 周期的主线程上，与 v2.0.2 已验证安全的环境一致。
+    // 再配合新增的已知宿主快路径，正常路径下连 objc_copyClassList 都不会被调用。
+    // 首轮：只走已知宿主快路径（零扫描、零无关类触达）；补装轮才允许命名空间扫描兜底。
+    dispatch_async(dispatch_get_main_queue(), ^{ CYInstallPopupGate(NO, NO, YES); });
+    // 1.2s 补装兜底（Swift 类注册可能晚于本 dylib），同样走主队列
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ CYInstallPopupGate(YES, YES, NO); });
 }
