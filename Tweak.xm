@@ -400,15 +400,74 @@ static CGFloat CYViewAreaRatio(UIView *v, UIWindow *win) {
     return best / winArea;
 }
 
-static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
-    CGRect f = v.frame;
+// 居中卡片特征（不挑业务文案的通用兜底，v2.0.2 由"仅直接挂 window"放宽为"窗口级浮层"）：
+//   ① 盖住屏幕中心；② 两侧留边（宽/高都不贴满屏，全屏页与遮罩在此被排除）；
+//   ③ 面积落在合理区间 —— 上限 0.55 排除全屏/大半屏容器，下限 0.06 排除小控件。
+// 老板实机观察：这个会员卡弹窗"居中显示、不大、最多四分之一屏"（约 0.25），
+// 远在区间内。旧版要求 superview == window，弹窗只要挂在任意容器上就整条链穿透，
+// 故 v2.0.2 改为与外层共享"不在 rootViewController.view 之下"这条更强且更准的护栏。
+static BOOL CYLooksLikeCenteredCard(UIView *v, UIWindow *win, CGFloat ratio) {
+    if (ratio < 0.06 || ratio > 0.55) return NO;
     CGFloat ww = win.bounds.size.width, wh = win.bounds.size.height;
     if (ww <= 0 || wh <= 0) return NO;
-    CGPoint center = CGPointMake(ww / 2, wh / 2);
-    if (!CGRectContainsPoint(f, center)) return NO;      // 不盖住屏幕中心 → 不是弹窗
-    CGFloat ratio = (f.size.width * f.size.height) / (ww * wh);
-    if (ratio < 0.04 || ratio > 0.92) return NO;         // 太小的控件 / 全屏页 → 不是弹窗
+    CGRect f = v.frame;
+    if (f.size.width <= 0 || f.size.height <= 0) return NO;
+    if (f.size.width > ww * 0.95 || f.size.height > wh * 0.95) return NO;  // 贴边 = 页面或遮罩
+    if (!CGRectContainsPoint(f, CGPointMake(ww / 2, wh / 2))) return NO;  // 不盖中心 = 不是弹窗
     return YES;
+}
+
+// 漏网定位（零噪音）。触发条件是"确实是窗口级浮层、但两级判定都没认出来"——
+// 正常使用下几乎不写。原先的探针条件是"宽度 ≥ 30% 屏"，实测把首页几十个卡片视图
+// 全刷进了日志（一次启动 40+ 行、累计 213 行），与"日志少写"的要求相悖，故收敛。
+// 真弹窗无论拦没拦住都必有留痕：拦住了写 [AdPopup]，没拦住写 [Overlay] leak。
+#define CY_PROBE_MAX 24
+static void CYCoverlayProbe(const char *cls, UIView *v, CGFloat ratio) {
+    static NSMutableSet *seen = nil;
+    static dispatch_once_t once;
+    static int probeCount = 0;
+    dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+    if (probeCount >= CY_PROBE_MAX) return;
+    NSString *key = [NSString stringWithUTF8String:cls];
+    if ([seen containsObject:key]) return;
+    [seen addObject:key];
+    probeCount++;
+    CGRect f = v.frame;
+    CYLog(@"[Overlay] leak? %s f=(%.0f,%.0f,%.0f,%.0f) r=%.2f",
+          cls, f.origin.x, f.origin.y, f.size.width, f.size.height, ratio);
+}
+
+// 兜底 D（布局延迟复核）。didMoveToWindow 触发时 autolayout 可能尚未布局，
+// frame/bounds 都还是 0 —— 此时任何基于面积的判据都会漏判，弹窗正好在"上屏那一帧"
+// 溜过 A/C 两层。这个可能性在 v2.0.1 的日志里无法证伪（那一轮没抓到弹窗），所以不赌。
+// 处理方式：对"窗口级浮层候选"（不在 rootViewController.view 之下）排**一次**主队列
+// 异步复核 —— 不做轮询、不装定时器；复核内部带尺寸/隐藏态短路，不会反复排队。
+// 正常页面（在 rootVC 之下）在这里直接返回：零开销、一次都不排。
+static void CYLateWindowCheck(UIView *v) {
+    if (!v) return;
+    UIWindow *w0 = v.window;
+    if (!w0) return;
+    UIView *rv0 = w0.rootViewController.view;
+    if (rv0 && (v == rv0 || [v isDescendantOfView:rv0])) return;
+
+    __weak UIView *weakV = v;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *sv = weakV;
+        if (!sv || sv.hidden) return;
+        UIWindow *w = sv.window;
+        if (!w) return;
+        CGFloat r = CYViewAreaRatio(sv, w);
+        if (r < 0.06) return;
+        UIView *rv = w.rootViewController.view;
+        if (rv && (sv == rv || [sv isDescendantOfView:rv])) return;
+        NSString *t = CYSubtreeMarketingText(sv, 0);
+        if (t || CYLooksLikeCenteredCard(sv, w, r)) {
+            CYLog(@"[AdPopup] killed late %s r=%.2f %@",
+                  class_getName([sv class]), r, t ? t : @"");
+            sv.hidden = YES;
+            sv.userInteractionEnabled = NO;
+        }
+    });
 }
 
 %hook UIView
@@ -420,43 +479,9 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
     if (!win) return;
 
     const char *cls = class_getName([self class]);
-    BOOL onWindow = (self.superview == win);
-    // 三条护栏，保证下面新增的"文案层"零误伤：
-    //   ① 位于 rootViewController.view 层级之下的视图 = 正常页面（首页/设置页/会员中心…），
-    //      永不判定。营销弹窗是"盖在页面之上"的窗口级浮层，不在其中 —— 这条把误伤压到零；
-    //   ② 系统容器视图（UI* / _UI*，如 UITransitionView / UILayoutContainerView）= 页面骨架；
-    //   ③ 面积不足半屏的直接跳过（绝大多数控件在这里就被排除，几乎不产生开销）。
-    BOOL isVCRoot = [self.nextResponder isKindOfClass:[UIViewController class]];
-    BOOL isSystemCls = (strncmp(cls, "UI", 2) == 0) || (strncmp(cls, "_UI", 3) == 0);
-    // rootViewController.view 的层级判定放进下面 if 内部做惰性求值：只有"面积过半屏"的
-    // 极小撮视图才需要走一次超级视图链，普通控件在面积那步就被短路掉了。
 
-    // 兜底 C（v2.0.1 新增，最关键的一层）：不挑类名、不挑父视图 —— 任何"盖住半屏以上 +
-    // 子树里出现运营文案"的视图一律收掉。之前所有兜底都要求"直接挂 window"，弹窗只要挂在
-    // 某个容器上就整条链静默穿透，这正是 8/30→9/28 整月零日志的根因。
-    if (!isSystemCls && CYViewAreaRatio(self, win) >= 0.50) {
-        UIView *rootView = win.rootViewController.view;
-        BOOL underRootVC = (rootView != NULL) && (self == rootView || [self isDescendantOfView:rootView]);
-        NSString *txt = underRootVC ? nil : CYSubtreeMarketingText(self, 0);
-        if (txt) {
-            CYLog(@"[AdPopup] killed %s by copy: %@", cls, txt);
-            self.hidden = YES;
-            self.userInteractionEnabled = NO;
-            UIView *sup = self.superview;
-            if (sup && sup != win && CYViewAreaRatio(sup, win) >= 0.90 && sup.subviews.count <= 3) {
-                // 父层是"纯遮罩容器"（几乎全屏 + 子视图极少）→ 一并收掉，
-                // 否则留下的透明遮罩会继续挡住正常点击。
-                sup.hidden = YES;
-                CYLog(@"[AdPopup] killed container %s too", class_getName([sup class]));
-            }
-        }
-    }
-    // 兜底 A：直接挂 window 的"居中卡片"浮层一律当弹窗干掉（不挑业务，全拦）
-    if (onWindow && CYLooksLikePopupOverlay(self, win)) {
-        CYLog(@"[Overlay] popup-like %s -> hidden", cls);
-        self.hidden = YES;
-    }
-    // 兜底 B：类名带会员/付费语义的浮层，直接隐藏
+    // 兜底 B（最便宜的一层）：类名带会员/付费/活动语义的浮层直接隐藏。纯 C 字符串
+    // 黑名单、零对象分配，放在最前面执行，命中即不必再走后面的几何/层级判定。
     if (CYIsAdOverlayClassName(cls)) {
         CYLog(@"[AdOverlay] hid %s", cls);
         self.hidden = YES;
@@ -469,23 +494,60 @@ static BOOL CYLooksLikePopupOverlay(UIView *v, UIWindow *win) {
                 CYLog(@"[AdOverlay] hid container %s", class_getName([container class]));
             }
         }
+        return;
     }
-    // 漏网定位（零噪音）：非系统类、直接挂 window、宽度 ≥ 30% 屏幕的可疑浮层，
-    // 同类只记一次。平时几乎不写；真弹窗出现时（无论拦没拦住）都会留下类名和尺寸，
-    // 方便从日志反推是哪一层没兜住。
-    if (!isVCRoot && strncmp(cls, "UI", 2) != 0 && strncmp(cls, "_UI", 3) != 0) {
-        CGRect f = self.frame;
-        if (f.size.width >= win.bounds.size.width * 0.30) {
-            static NSMutableSet *seen = nil;
-            static dispatch_once_t once;
-            dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
-            NSString *key = [NSString stringWithUTF8String:cls];
-            if (![seen containsObject:key]) {
-                [seen addObject:key];
-                CYLog(@"[Overlay] %s f=(%.0f,%.0f,%.0f,%.0f)",
-                      cls, f.origin.x, f.origin.y, f.size.width, f.size.height);
-            }
+
+    // 系统容器视图（UI* / _UI*，如 UITransitionView / UILayoutContainerView）= 页面骨架，不碰
+    if ((strncmp(cls, "UI", 2) == 0) || (strncmp(cls, "_UI", 3) == 0)) return;
+
+    // 热路径短路：面积门槛先算，按钮/文字/图标等绝大多数控件在这里就被排除，
+    // 下面"超级视图链 + 子树文案扫描"这两项相对昂贵的操作只在极少数够大的视图上执行。
+    // 门槛取 0.06（约 1/16 屏）—— 老板实机观察这个会员卡弹窗"居中、不大、最多四分之一屏"
+    // （约 0.25），旧版门槛是 0.50（半屏），根本够不着它，这是上一轮没拦住的直接原因。
+    CGFloat ratio = CYViewAreaRatio(self, win);
+    if (ratio < 0.06) {
+        // 尺寸还没算出来 —— 可能是"上屏那一帧 autolayout 尚未布局"，也可能是真的小控件。
+        // 交给兜底 D 排一次主队列复核（只对窗口级浮层候选排队，正常页面零开销）。
+        CYLateWindowCheck(self);
+        return;
+    }
+
+    // 唯一的误伤护栏（比旧版"必须直接挂 window"更强也更准）：位于 rootViewController.view
+    // 层级之下的就是正常页面内容（首页卡片、设置页、会员中心…），永不判定。营销弹窗是
+    // "盖在页面之上"的窗口级浮层，天然不在其中 —— 正因为有这条，下面才敢把面积门槛
+    // 压到 0.06 并使用不挑业务文案的通用形状判据。
+    // 注：旧版要求 superview == window，弹窗只要挂在任意容器上就整条链静默穿透，
+    // 这正是 8/30→9/28 整月零命中的根因。
+    UIView *rootView = win.rootViewController.view;
+    if (rootView != NULL && (self == rootView || [self isDescendantOfView:rootView])) return;
+
+    // 兜底 C（最强判据）：子树里出现强运营文案（年卡 / 终身 / 立即开通 / 先不看 / 去看看…）
+    NSString *txt = CYSubtreeMarketingText(self, 0);
+    if (txt) {
+        CYLog(@"[AdPopup] killed %s by copy: %@", cls, txt);
+        self.hidden = YES;
+        self.userInteractionEnabled = NO;
+        UIView *sup = self.superview;
+        if (sup && sup != win && CYViewAreaRatio(sup, win) >= 0.90 && sup.subviews.count <= 3) {
+            // 父层是"纯遮罩容器"（几乎全屏 + 子视图极少）→ 一并收掉，
+            // 否则留下的透明遮罩会继续挡住正常点击。
+            sup.hidden = YES;
+            CYLog(@"[AdPopup] killed container %s too", class_getName([sup class]));
         }
+        return;
+    }
+
+    // 兜底 A：不依赖任何业务文案的通用形状判据（居中卡片）→ 一律收掉
+    if (CYLooksLikeCenteredCard(self, win, ratio)) {
+        CYLog(@"[AdPopup] hid centered card %s r=%.2f", cls, ratio);
+        self.hidden = YES;
+        self.userInteractionEnabled = NO;
+        return;
+    }
+
+    // 走到这里 = "确实是窗口级浮层、但两级判定都没认出来" → 留一条证，便于下次精准收口
+    if (![self.nextResponder isKindOfClass:[UIViewController class]]) {
+        CYCoverlayProbe(cls, self, ratio);
     }
 }
 
@@ -669,12 +731,22 @@ static void CYInstallDidAddSubviewGuard(void) {
 // ---- 签名适配 hook 模板：一种模板严格对应一种 typeEncoding ----
 // 装机前逐条比对（先剥掉帧偏移数字再比），完全匹配才 hook。
 // 只有"签名完全一致"才敢动手 —— 这是 v1.7.x 拿返回值类型不匹配换来崩设置页的教训。
+// 命中日志按 selector 限流：一个进程内每档只记首条（实测 popupsArrWithDict: 单次启动
+// 就会命中 5 次，逐条打印会把日志刷成流水账，与"日志少写"的要求相悖）。
+#define CY_GATE_HIT_ONCE(ID)                    \
+    static int logged_##ID = 0;                 \
+    int doLog_##ID = (logged_##ID < 1);         \
+    if (doLog_##ID) logged_##ID++;
+
 #define CY_GATE_VOID_OBJARG(ID, SELNAME)                                            \
     static void (*orig_##ID)(id, SEL, id) = NULL;                                   \
     static void imp_##ID(id self, SEL _cmd, id arg) {                               \
-        NSArray *a = [arg isKindOfClass:[NSArray class]] ? (NSArray *)arg : nil;    \
-        CYLog(@"[PopupGate] hit " SELNAME " on %s n=%lu",                           \
-              class_getName([self class]), (unsigned long)a.count);                 \
+        CY_GATE_HIT_ONCE(ID)                                                        \
+        if (doLog_##ID) {                                                           \
+            NSArray *a = [arg isKindOfClass:[NSArray class]] ? (NSArray *)arg : nil; \
+            CYLog(@"[PopupGate] hit " SELNAME " on %s n=%lu",                       \
+                  class_getName([self class]), (unsigned long)a.count);             \
+        }                                                                           \
         if (orig_##ID) orig_##ID(self, _cmd, @[]);                                  \
     }
 
@@ -682,16 +754,22 @@ static void CYInstallDidAddSubviewGuard(void) {
     static void (*orig_##ID)(id, SEL) = NULL;                                       \
     static void imp_##ID(id self, SEL _cmd) {                                       \
         (void)orig_##ID;                                                            \
-        CYLog(@"[PopupGate] hit " SELNAME " (swallowed) on %s",                     \
-              class_getName([self class]));                                         \
+        CY_GATE_HIT_ONCE(ID)                                                        \
+        if (doLog_##ID) {                                                           \
+            CYLog(@"[PopupGate] hit " SELNAME " (swallowed) on %s",                 \
+                  class_getName([self class]));                                     \
+        }                                                                           \
     }
 
 #define CY_GATE_OBJRET_OBJARG(ID, SELNAME)                                          \
     static id (*orig_##ID)(id, SEL, id) = NULL;                                     \
     static id imp_##ID(id self, SEL _cmd, id arg) {                                 \
         (void)orig_##ID;                                                            \
-        CYLog(@"[PopupGate] hit " SELNAME " (starved) on %s",                       \
-              class_getName([self class]));                                         \
+        CY_GATE_HIT_ONCE(ID)                                                        \
+        if (doLog_##ID) {                                                           \
+            CYLog(@"[PopupGate] hit " SELNAME " (starved) on %s",                   \
+                  class_getName([self class]));                                     \
+        }                                                                           \
         return @[];                                                                 \
     }
 
@@ -701,7 +779,6 @@ CY_GATE_VOID_NOARG(handleNextPopup,      "handleNextPopup")
 CY_GATE_OBJRET_OBJARG(popupsArrWithDict, "popupsArrWithDict:")
 
 static NSMutableSet *gPopupGateArmed = nil;
-static int gPopupGateLogCount = 0;
 
 // typeEncoding 常带帧偏移数字（如 v24@0:8@16），比对前先剥掉数字
 static void CYNormalizeTypeEncoding(const char *enc, char *out, size_t cap) {
@@ -731,29 +808,14 @@ static const CYGateTarget kCYGateTargets[] = {
     { NULL, NULL, NULL, NULL }
 };
 
-// 取证：把"本来要弹什么"写进日志（队列元素的类名）。命中才记 + 条数上限，避免刷屏。
-static void __attribute__((unused)) CYPopupGateRecord(const char *tag, id self, NSArray *arr) {
-    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) return;
-    if (gPopupGateLogCount >= 40) return;
-    gPopupGateLogCount++;
-    NSMutableArray *names = [NSMutableArray array];
-    NSUInteger n = arr.count < 8 ? arr.count : 8;
-    for (NSUInteger i = 0; i < n; i++) {
-        id e = arr[i];
-        [names addObject:NSStringFromClass([e class])];
-    }
-    CYLog(@"[PopupGate] %s on %s n=%lu {%@}", tag, class_getName([self class]),
-          (unsigned long)arr.count, [names componentsJoinedByString:@" "]);
-}
-
-// 总闸：入队口清空队列。
-// 传 @[] 而不是 nil —— 该属性是 copy 语义，空数组是合法值，下游按 count 做的
-// 边界判断天然安全（这个队列本来就要支持"今天没有弹窗"的情况）。
-// （队列内容取证已合并进 CY_GATE_VOID_OBJARG 宏的 n= 字段）
-
-// 观测层（不改变行为）：确认清空队列后调度链是否仍被走到、参数是什么。
-// 保留原参数原样转发，只为取证，不参与拦截，避免影响 App 正常流程。
-// （观测层已由 kCYGateTargets 统一驱动，不再单独实现）
+// 总闸的行为说明：
+// · setHomePopupArray: / handlePopupArray: → 一律传 @[]（而不是 nil）。该属性是 copy
+//   语义，空数组是合法值，下游按 count 做的边界判断天然安全 —— 这个队列本来就要支持
+//   "今天没有弹窗"的情况，所以清空不会让 App 进入异常状态（实测启动/首页/设置/会员页均正常）。
+// · handleNextPopup（无参无返回）→ 吞掉不转发，队列不再往下推进。
+// · popupsArrWithDict: → 返回 @[]，从**解析入口**就断供，这是效果最干净的一层：
+//   实测它每次启动被调 5 次、每次都被 starving，下游 setHomePopupArray: 因此从未被调用过。
+// 队列内容取证已合并进 CY_GATE_VOID_OBJARG 宏的 n= 字段。
 
 // 在彩云命名空间内找"真正实现"某 selector 的类（跳过只继承的子类，避免重复 swizzle）
 // 宿主查找同时覆盖实例方法与类方法，并返回"真正实现"该 selector 的所有类
@@ -766,6 +828,24 @@ typedef struct {
     BOOL  isClassMethod;
 } CYGateHost;
 
+// 系统/框架类前缀。第一轮兜底扫描曾经"谁实现同名 selector 就挂谁"，实测踩雷：
+// handleNextPopup 是 v@:（无参无返回），而 UIKeyboardCandidateViewStyle /
+// UIKeyboardCandidateViewState 恰好也有同名同签名方法 → 被一起 swizzle，
+// 而这一档 hook 是"吞掉不转发"，会直接破坏键盘候选条翻页。
+// 但绝不能再退回"过滤掉就算、失败还静默"的老坑，所以策略改成两段式：
+//   第一轮只认 App 自己的命名空间，命中即收工（系统类永远不碰，零误伤）；
+//   第一轮为空才进第二轮兜底，且第二轮显式跳过系统类前缀。
+static BOOL CYIsSystemClassName(const char *cn) {
+    if (!cn || !cn[0]) return YES;
+    static const char *kPrefixes[] = {
+        "UI", "_UI", "NS", "_NS", "CA", "CG", "CF", "AV", "WK", "MK", "SK", "MAMap", "MA", NULL
+    };
+    for (int i = 0; kPrefixes[i]; i++) {
+        if (strncmp(cn, kPrefixes[i], strlen(kPrefixes[i])) == 0) return YES;
+    }
+    return NO;
+}
+
 static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
@@ -773,6 +853,8 @@ static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
     unsigned int found = 0;
 
     for (int pass = 0; pass < 2 && found < maxOut; pass++) {
+        // 第一轮已经拿到 App 自己的宿主 → 不再碰任何外部类（避免误伤系统框架）
+        if (pass == 1 && found > 0) break;
         for (unsigned int i = 0; i < count && found < maxOut; i++) {
             Class c = classes[i];
             const char *cn = class_getName(c);
@@ -780,6 +862,7 @@ static unsigned int CYGateHosts(SEL sel, CYGateHost *out, unsigned int maxOut) {
             BOOL isNS = (strncmp(cn, "ColorfulCloudsPro.", 18) == 0);
             if (pass == 0 && !isNS) continue;
             if (pass == 1 && isNS) continue;
+            if (pass == 1 && CYIsSystemClassName(cn)) continue;
 
             Method m = class_getInstanceMethod(c, sel);
             if (m) {
@@ -822,10 +905,20 @@ static const char *CYHostTypeEncoding(Class hookTarget, SEL sel) {
 }
 
 static void CYInstallPopupGate(void) {
+    // 扩展进程（.appex：widget / 通知扩展…）里没有首页弹窗，跳过 —— 省掉一次全类表
+    // 扫描，也避免同一份日志被两个进程各写一遍（实测日志里出现过两批相隔 10s 的装弹记录）。
+    static NSString *bundlePath = nil;
+    if (!bundlePath) bundlePath = [[NSBundle mainBundle] bundlePath];
+    if ([bundlePath hasSuffix:@".appex"]) return;
+
     static dispatch_once_t once;
     dispatch_once(&once, ^{ gPopupGateArmed = [NSMutableSet set]; });
 
+    NSMutableArray *summary = [NSMutableArray array];
+    int total = 0, armedTotal = 0;
+
     for (const CYGateTarget *t = kCYGateTargets; t->sel; t++) {
+        total++;
         NSString *key = [NSString stringWithUTF8String:t->sel];
         if ([gPopupGateArmed containsObject:key]) continue;
 
@@ -838,28 +931,35 @@ static void CYInstallPopupGate(void) {
         }
 
         BOOL armedAny = NO;
+        const char *lastEnc = NULL;
         for (unsigned int i = 0; i < n; i++) {
             Class target = hosts[i].hookTarget;
             const char *enc = CYHostTypeEncoding(target, sel);
             char norm[64];
             CYNormalizeTypeEncoding(enc, norm, sizeof(norm));
-            if (strcmp(norm, t->enc) != 0) {
-                CYLog(@"[PopupGate] SKIP %@ on %s%s enc=%s (want %s)",
-                      key, hosts[i].isClassMethod ? "+" : "-",
-                      class_getName(hosts[i].owner), enc ? enc : "?", t->enc);
-                continue;
-            }
+            lastEnc = enc;
+            // 签名不符：静默跳过（正常现象，同级同名方法很多），只有"全败"才上报
+            if (strcmp(norm, t->enc) != 0) continue;
             MSHookMessageEx(target, sel, t->imp, t->origSlot);
             armedAny = YES;
-            CYLog(@"[PopupGate] ARMED %@ on %s%s enc=%s",
-                  key, hosts[i].isClassMethod ? "+" : "-",
-                  class_getName(hosts[i].owner), norm);
+            [summary addObject:[NSString stringWithFormat:@"%@=%s%s", key,
+                                hosts[i].isClassMethod ? "+" : "-",
+                                class_getName(hosts[i].owner)]];
         }
         if (armedAny) {
+            armedTotal++;
             [gPopupGateArmed addObject:key];
         } else {
-            CYLog(@"[PopupGate] UNARMED %@ -- signature mismatch on all %u host(s)", key, n);
+            // 失败必须留痕：上一版就是"失败什么都不打"导致白等一整轮
+            CYLog(@"[PopupGate] UNARMED %@ want=%s got=%s hosts=%u",
+                  key, t->enc, lastEnc ? lastEnc : "?", n);
         }
+    }
+
+    // 成功路径压缩成一行（老板要求"日志少写"），异常才逐条展开
+    if (summary.count > 0) {
+        CYLog(@"[PopupGate] armed %d/%d %@", armedTotal, total,
+              [summary componentsJoinedByString:@" "]);
     }
 }
 
