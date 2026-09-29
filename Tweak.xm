@@ -1223,6 +1223,208 @@ static BOOL CYInstallPopupGate(BOOL refreshClasses, BOOL allowScan, BOOL verbose
     return complete;
 }
 
+#pragma mark - 后台解码闸（YYKit 的 WebP 动画帧解码）
+//
+// 【现象】退到后台后本进程 CPU 冲到 94~99%，持续约 70 秒（spindump 实测 10s 窗口内
+//   CPU Time 9.905s）。老板**关掉全部插件**后现象不变 —— 与本插件及任何插件无关，
+//   是彩云天气自己的行为。
+//
+// 【归因】spindump 逐线程归因：单轮 9.402s 里 9.120s（97%）压在同一行
+//     -[_YYAnimatedImageViewFetchOperation main]        ← App 内嵌 YYKit 的私有类
+//       → YYImageDecoder frameAtIndex: / _newBlendedImageWithFrame:
+//         → _WebPDecode → _DecodeInto → _VP8Decode → _FinishRow → _EmitFancyRGB
+//           → _UpsampleBgraLinePair / _ApplyAlphaMultiply / _DispatchAlpha
+//   即**持续把 WebP 动画图的每一帧解成位图**（帧内多线程并行，所以单核打满）。
+//   运行时类名（__objc_classname 段明文）确认为 `_YYAnimatedImageViewFetchOperation`。
+//
+// 【它凭什么能在后台一直跑】Info.plist 的 UIBackgroundModes 带了 `audio`
+//   （主二进制里有 AVAudioPlayer×12 / AVAudioSessionCategoryPlayback / AVAudioEngine），
+//   靠 audio 会话拿后台存活权。本版已把**整个 UIBackgroundModes**（audio +
+//   remote-notification）从 Info.plist 摘掉 —— 它连"被静默推送唤醒"的通道也没有了。
+//   下面这层是**双保险**：即便它还能活着，也别再解码。
+//
+//   ⚠️ 去掉 remote-notification **不影响通知推送的显示**（横幅/声音/角标由 APNs 直接
+//   投递给系统，不经过 App），只影响"后台被静默唤醒执行代码"。小组件
+//   （ProWidgetExtensionExtension.appex）是独立进程、自带 NSURLSession 直连
+//   wrapper.cyapi.cn，本就不依赖主 App 后台存活，刷新不受影响。
+//
+// 【为什么纯浪费】后台时 App 的 layer 根本不渲染，解出来的帧没有任何人看，
+//   循环还在替下一帧继续解码（预取链自续）。
+//
+// 【策略】**只在「App 不在前台」时禁解码，前台动效零影响**（不改变任何 UI 行为）：
+//   L1 硬闸 —— hook -[_YYAnimatedImageViewFetchOperation main]，非前台直接返回。
+//              连预取链一起断：下一环是在 main 内/完成时新建 op，返回后不再产生新 op。
+//   L2 冻结 —— 进后台把已注册实例的 autoPlayAnimatedImage 置 NO，回前台恢复原值
+//              （只恢复"被我们改过"的，用 associated object 记账）+ setNeedsDisplay
+//              重新点火，防止 L1 断链后回前台动画僵住。
+//   L3 注册 —— hook -[YYAnimatedImageView didMoveToWindow] 收实例（弱表，零强引用，
+//              视图销毁自动出表）。
+//
+// 【线程安全】gCYForeground 是由通知维护、在主线程写的原子量；硬闸跑在
+//   NSOperationQueue 的工作线程上，只做一次原子读 —— 不在工作线程上碰
+//   UIApplication.applicationState（跨线程读 UI 状态不安全，也不值得）。
+//   初值 = 前台：进程启动阶段必然可见，随后通知会逐次修正。
+//
+// 【Android 式"保活"的代价】这段解码是纯粹的耗电：实测两段尖峰合计约 70 秒满载。
+//   前台时 gCYForeground=1，一切照旧，天气动效完全不受影响。
+
+// YYKit 的私有类/类只做声明，不用 %hook —— 走手工 MSHookMessageEx，理由同 CYVipSafe：
+// ABI 明确（均为 @objc 方法），且能拿到"装没装上"的真实返回值，便于日志判定与重试。
+@interface _YYAnimatedImageViewFetchOperation : NSOperation
+@end
+
+@interface YYAnimatedImageView : UIImageView
+@property (nonatomic) BOOL autoPlayAnimatedImage;   // 实测存在的公开属性，默认 YES
+@end
+
+static NSHashTable *gCYAnimatedViews = nil;      // 弱表：只登记，不持有
+static volatile int32_t gCYForeground = 1;       // 1 = 前台（允许解码），0 = 后台（拦）
+static unsigned long long gCYFetchSkipped = 0;   // 后台被拦下的解码操作数（原子累加）
+static unsigned long long gCYFrozenViews = 0;    // 被我们冻结过的实例数（累计）
+static void (*origFetchOpMain)(id, SEL) = NULL;
+static void (*origYYViewDidMoveToWindow)(id, SEL) = NULL;
+static const void *kCYFrozenKey = &kCYFrozenKey;
+
+// L1：硬闸。后台时连 %orig 都不调 —— 不解码、不建后续 op（op 会立刻被判定完成）。
+static void CYFetchOpMain(id self, SEL _cmd) {
+    if (gCYForeground == 0) {
+        __atomic_fetch_add(&gCYFetchSkipped, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    if (origFetchOpMain) origFetchOpMain(self, _cmd);
+}
+
+// L2 冻结：只动"本来在自动播"的实例，并用 associated object 记账，
+// 保证回前台只恢复被我们改过的，不去覆盖 App 自己的选择。
+// 返回 YES 表示"这次真的冻了" —— 日志计数靠返回值，不靠事后猜状态
+// （否则 autoPlay 本来就是 NO 的静态图会被误计成"我们冻的"，日志就撒谎了）。
+static BOOL CYFreezeAnimatedView(id v) {
+    if (!v) return NO;
+    YYAnimatedImageView *iv = (YYAnimatedImageView *)v;
+    if (![iv respondsToSelector:@selector(autoPlayAnimatedImage)]) return NO;
+    if (![iv respondsToSelector:@selector(setAutoPlayAnimatedImage:)]) return NO;
+    if (!iv.autoPlayAnimatedImage) return NO;                 // 本来就不自动播 → 不碰
+    objc_setAssociatedObject(iv, kCYFrozenKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    iv.autoPlayAnimatedImage = NO;
+    __atomic_fetch_add(&gCYFrozenViews, 1, __ATOMIC_RELAXED);
+    return YES;
+}
+
+static BOOL CYRestoreAnimatedView(id v) {
+    if (!v) return NO;
+    YYAnimatedImageView *iv = (YYAnimatedImageView *)v;
+    if (!objc_getAssociatedObject(iv, kCYFrozenKey)) return NO; // 不是我们冻的 → 不管
+    objc_setAssociatedObject(iv, kCYFrozenKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    iv.autoPlayAnimatedImage = YES;
+    [iv setNeedsDisplay];     // 重新点火：L1 断过链，需要一个触发点把动效接回来
+    return YES;
+}
+
+// L3：登记实例。didMoveToWindow 是所有视图上屏/离屏的必经点，插弱表几乎零成本。
+static void CYAnimatedViewDidMoveToWindow(id self, SEL _cmd) {
+    if (gCYAnimatedViews) [gCYAnimatedViews addObject:self];
+    if (gCYForeground == 0) CYFreezeAnimatedView(self);   // 后台新建的视图：出生就冻住
+    if (origYYViewDidMoveToWindow) origYYViewDidMoveToWindow(self, _cmd);
+}
+
+static void CYDecodeGateEnterBackground(void) {
+    gCYForeground = 0;                       // 先关闸，再冻结（顺序不能反）
+    unsigned int frozen = 0;
+    for (id v in gCYAnimatedViews.allObjects) {
+        if (CYFreezeAnimatedView(v)) frozen++;   // 计"真冻了的"，不靠事后猜状态
+    }
+    // "少写"：没有动画实例就不写，有才写（这一行同时是"通知链路活着"的证据）。
+    if (frozen > 0) CYLog(@"[DecodeGate] bg → frozen %u views", frozen);
+}
+
+static void CYDecodeGateEnterForeground(void) {
+    // 先开闸再恢复：否则 restore 的 setNeedsDisplay 触发的解码会被自己拦掉。
+    gCYForeground = 1;
+    unsigned int restored = 0;
+    for (id v in gCYAnimatedViews.allObjects) {
+        if (CYRestoreAnimatedView(v)) restored++;
+    }
+    unsigned long long skipped = __atomic_exchange_n(&gCYFetchSkipped, 0, __ATOMIC_RELAXED);
+    // 只在真的拦到过东西时写一行 —— 后台空转（没有动画图）时保持零日志。
+    if (skipped > 0 || restored > 0) {
+        CYLog(@"[DecodeGate] fg → gate open, restored %u views, blocked %llu bg decodes",
+              restored, skipped);
+    }
+}
+
+// 只在"类自己实现了"该方法时才 hook。
+// 必须的守卫：substrate 的 MSHookMessageEx 走的是 class_getInstanceMethod +
+// method_setImplementation —— 若 sel 是**继承**来的，被改掉的会是父类的实现。
+// 例如 YYAnimatedImageView 若没重写 didMoveToWindow，这一钩就会落到 UIView 上，
+// 等于给全 App 每个视图都挂上我们的钩子（灾难级副作用）。
+// 用"自己的 IMP != 父类的 IMP"判定，零歧义。
+static BOOL CYClassOverridesSelector(Class cls, SEL sel) {
+    if (!cls || !sel) return NO;
+    Method own = class_getInstanceMethod(cls, sel);
+    if (!own) return NO;
+    Class sup = class_getSuperclass(cls);
+    if (!sup) return YES;
+    Method parent = class_getInstanceMethod(sup, sel);
+    if (!parent) return YES;                        // 父类没有 → 必定是自己的
+    return method_getImplementation(own) != method_getImplementation(parent);
+}
+
+static void CYInstallDecodeGate(void) {
+    // 两个 hook 用 MSHookMessageEx 直接挂，失败可重试（App 升级换类名时日志会说话）。
+    static BOOL fetchHooked = NO, viewHooked = NO;
+    if (!fetchHooked) {
+        Class opCls = objc_getClass("_YYAnimatedImageViewFetchOperation");
+        if (opCls && CYClassOverridesSelector(opCls, @selector(main))) {
+            MSHookMessageEx(opCls, @selector(main),
+                            (IMP)CYFetchOpMain, (IMP *)&origFetchOpMain);
+            fetchHooked = YES;
+        }
+    }
+    if (!viewHooked) {
+        Class viewCls = objc_getClass("YYAnimatedImageView");
+        if (viewCls && CYClassOverridesSelector(viewCls, @selector(didMoveToWindow))) {
+            MSHookMessageEx(viewCls, @selector(didMoveToWindow),
+                            (IMP)CYAnimatedViewDidMoveToWindow,
+                            (IMP *)&origYYViewDidMoveToWindow);
+            viewHooked = YES;
+        }
+    }
+    if (!gCYAnimatedViews) gCYAnimatedViews = [NSHashTable weakObjectsHashTable];
+
+    // 通知订阅只做一次。三条都要：willEnterForeground 备帧、didBecomeActive 兜底，
+    // 而 willResignActive（下拉通知中心/来电）**故意不订阅** —— 那时 App 仍可见，不该关闸。
+    static BOOL observersInstalled = NO;
+    if (!observersInstalled) {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        NSOperationQueue *main = [NSOperationQueue mainQueue];
+        [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
+                        object:nil queue:main
+                    usingBlock:^(NSNotification *note) { CYDecodeGateEnterBackground(); }];
+        [nc addObserverForName:UIApplicationWillEnterForegroundNotification
+                        object:nil queue:main
+                    usingBlock:^(NSNotification *note) { CYDecodeGateEnterForeground(); }];
+        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil queue:main
+                    usingBlock:^(NSNotification *note) {
+                        if (gCYForeground == 0) CYDecodeGateEnterForeground();
+                    }];
+        observersInstalled = YES;
+    }
+
+    // 一行结果，含两侧装弹状态（0/1）。装齐只打一次（补装轮会再调一次本函数，必须幂等）；
+    // 没装齐则每次都写 —— 那说明 App 换类名了，这种"失败日志"值得刷屏提醒。
+    static BOOL loggedArmed = NO;
+    if (!loggedArmed) {
+        if (fetchHooked && viewHooked) {
+            CYLog(@"[DecodeGate] armed (fetchOp.main=1 viewDidMoveToWindow=1)");
+            loggedArmed = YES;
+        } else {
+            CYLog(@"[DecodeGate] PARTIAL (fetchOp.main=%d viewDidMoveToWindow=%d) will retry",
+                  fetchHooked ? 1 : 0, viewHooked ? 1 : 0);
+        }
+    }
+}
+
 %ctor {
     double t0 = [NSDate timeIntervalSinceReferenceDate];
     CYInstallDidAddSubviewGuard();   // 零闪烁主拦截：任意父视图一加会员/付费子视图就移除
@@ -1247,6 +1449,10 @@ static BOOL CYInstallPopupGate(BOOL refreshClasses, BOOL allowScan, BOOL verbose
     // 日志也少写两行。
     dispatch_async(dispatch_get_main_queue(), ^{
         BOOL complete = CYInstallPopupGate(NO, NO, YES);
+        // v2.2.0 后台解码闸：装 D-YYKit 这一层。放在这里而不是 %ctor 帧里，理由同上
+        // （不在 dyld 加载帧做 runtime 操作）。App 内嵌 YYKit 且启动时已加载，
+        // 首轮必然拿得到类；万一落空，下面补装轮还会再调一次（函数幂等）。
+        CYInstallDecodeGate();
         if (!complete) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -1254,6 +1460,7 @@ static BOOL CYInstallPopupGate(BOOL refreshClasses, BOOL allowScan, BOOL verbose
                 // 已经包含 1.2s 后才注册的类）。原先是 YES，会 free + 重拷全表 ——
                 // 若四个 selector 都落空，就要白拷 4 次全表（每次都要 runtime 锁 + malloc）。
                 CYInstallPopupGate(NO, YES, NO);
+                CYInstallDecodeGate();   // 幂等；只为"首轮 YYKit 尚未注册"这种情况兜一次
             });
         }
     });
